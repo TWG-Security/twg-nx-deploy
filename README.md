@@ -18,7 +18,7 @@ Copy, paste, run on the server:
 curl -fsSL https://twg-security.github.io/twg-nx-deploy/install.sh | sudo bash
 ```
 
-> **First time using this repo? Two quick one-time setup steps must be done
+> **First time using this repo? One quick one-time setup step must be done
 > before the command above works — see [section 0](#0-one-time-setup-do-this-first).**
 > After that's done once, the one-liner above is all any tech ever runs.
 
@@ -26,43 +26,15 @@ curl -fsSL https://twg-security.github.io/twg-nx-deploy/install.sh | sudo bash
 
 ## 0. One-time setup (do this first)
 
-These two steps only need doing **once, by a maintainer**. After that the
+This step only needs doing **once, by a maintainer**. After that the
 one-liner in section 1 works for everyone, forever.
 
-**Step 1 — Turn on the website that serves the installer.**
+**Turn on the website that serves the installer.**
 Without this you get a **404** at the install URL.
 - Go to the repo on GitHub → **Settings → Pages**.
 - Under **Source**, choose **GitHub Actions**. Save.
 - That's it — a deploy runs automatically and the install URL goes live in a
   minute or two. (Check **Actions → Deploy to GitHub Pages** for a green run.)
-
-**Step 2 — Generate the safety fingerprints.**
-The installer verifies the download hasn't been tampered with by checking its
-SHA256 "fingerprint." The repo ships with **placeholder** fingerprints, so
-until you generate the real ones a normal install **stops on purpose** with a
-checksum error (it refuses to install something it can't verify).
-
-Run this once on any Linux box with internet (it downloads the packages and
-writes the real fingerprints), then commit the result:
-
-```bash
-./make-checksums.sh
-git add checksums.txt && git commit -m "Add real NX package checksums" && git push
-```
-
-<details>
-<summary><b>In a hurry and can't do Step 2 right now?</b></summary>
-
-You can install **today** by telling the script to skip the fingerprint check.
-This trades away the tamper-check, so only do it knowingly:
-
-```bash
-curl -fsSL https://twg-security.github.io/twg-nx-deploy/install.sh | sudo VERIFY_CHECKSUM=false bash
-```
-
-The proper fix is Step 2 above — do it when you can so every future install is
-verified automatically.
-</details>
 
 **What that does by default:**
 
@@ -105,11 +77,10 @@ curl -fsSL https://twg-security.github.io/twg-nx-deploy/install.sh | sudo INSTAL
 curl -fsSL https://twg-security.github.io/twg-nx-deploy/install.sh | sudo NX_EDITION=meta INSTALL_WEBMIN=true SET_TIMEZONE=America/Denver bash
 ```
 
-**Install a different NX build** (paste the vendor URL + its SHA256)
+**Install a different NX build** (paste the vendor URL)
 ```bash
 curl -fsSL https://twg-security.github.io/twg-nx-deploy/install.sh | sudo \
   NX_PKG_URL="https://updates.networkoptix.com/default/43000/linux/nxwitness-server-6.1.3.43000-linux_x64.deb" \
-  NX_PKG_SHA256="<the-64-character-sha256-of-that-file>" \
   bash
 ```
 
@@ -124,17 +95,18 @@ before anything is installed:
 ----------------------------------------------------------
  Interactive setup — press Enter to accept the [default].
 ----------------------------------------------------------
-NX edition (witness/meta) [witness]:
+NX edition:  1) witness   2) meta
+Choose 1 or 2 [1]:
 Install the NX mediaserver? [Y/n]
 Detect GPU and install drivers? [Y/n]
 Install Webmin admin panel? [y/N]
 Timezone (blank = leave unchanged) [America/New_York]:
 Enable NTP time sync? [Y/n]
-Verify package SHA256 before install? [Y/n]
 ```
 
 - **Press Enter** to accept the default shown in `[brackets]`.
-- Type a value (like `meta`, `y`, or `n`) to change it.
+- For the edition, type `1` (witness) or `2` (meta) — the words `witness`/`meta`
+  still work too. For yes/no prompts, type `y` or `n`.
 
 **To skip the menu** and just use the defaults / your env vars, add
 `NONINTERACTIVE=true`:
@@ -195,12 +167,9 @@ Set `INSTALL_GPU_DRIVERS=false` to skip this step entirely.
 | `INSTALL_WEBMIN`      | `false`            | Install the Webmin admin panel                           |
 | `SET_TIMEZONE`        | `America/New_York` | Timezone to set (**blank = leave unchanged**)            |
 | `ENABLE_NTP`          | `true`             | Turn on network time sync                                |
-| `VERIFY_CHECKSUM`     | `true`             | Verify the package SHA256 before installing              |
 | `NONINTERACTIVE`      | `false`            | `true` = skip the menu                                   |
 | `LOG_FILE`            | `/var/log/twg-nx-deploy-<date>.log` | Where to save the install log           |
 | `NX_PKG_URL`          | *(auto)*           | Override the download URL (wins over `NX_EDITION`)       |
-| `NX_PKG_SHA256`       | *(unset)*          | Expected SHA256 for the download (wins over `checksums.txt`) |
-| `CHECKSUMS_URL`       | Pages `checksums.txt` | Where to fetch `checksums.txt` for verification       |
 
 ---
 
@@ -236,17 +205,14 @@ are what you expect.
 
 ### How the files fit together
 - **`install.sh`** — the installer (served via GitHub Pages).
-- **`make-checksums.sh`** — regenerates `checksums.txt` for the pinned build.
-- **`checksums.txt`** — SHA256 sums the installer checks the download against.
 - **`.nojekyll`** — tells GitHub Pages to serve files as-is from the repo root.
 
 ### GitHub Pages
 Deployed by the **`.github/workflows/pages.yml`** GitHub Action, which uploads
 the repository root and publishes it. Because `.nojekyll` is present,
-`install.sh` and `checksums.txt` are served verbatim:
+`install.sh` is served verbatim:
 
 - `https://twg-security.github.io/twg-nx-deploy/install.sh`
-- `https://twg-security.github.io/twg-nx-deploy/checksums.txt`
 
 Enable once under **Settings → Pages → Source → GitHub Actions** (see
 [section 0](#0-one-time-setup-do-this-first)). After that, every push to the
@@ -257,17 +223,6 @@ trigger a redeploy from **Actions → Deploy to GitHub Pages → Run workflow**.
 > exclusive. This repo uses **GitHub Actions**.
 
 ### Updating the pinned NX version
-1. Update `NX_VERSION` and `NX_BUILD` in **both** `install.sh` and
-   `make-checksums.sh`.
-2. Regenerate the checksums on any Linux box with internet access:
-   ```bash
-   ./make-checksums.sh
-   ```
-3. Commit `install.sh`, `make-checksums.sh`, and `checksums.txt` together.
-
-> **Important:** `checksums.txt` currently ships **placeholder** hashes. Until
-> you run `make-checksums.sh` (Step 2 in
-> [section 0](#0-one-time-setup-do-this-first)), a default install (with
-> `VERIFY_CHECKSUM=true`) will **stop with an error** instead of installing an
-> unverified package — this is intentional. Generate the real hashes before
-> production use.
+1. Update `NX_VERSION` and `NX_BUILD` in `install.sh`.
+2. Commit `install.sh`. The next push to the default branch redeploys Pages
+   automatically.

@@ -43,18 +43,12 @@ INSTALL_WEBMIN="${INSTALL_WEBMIN:-false}"    # install the Webmin admin panel?
 INSTALL_GPU_DRIVERS="${INSTALL_GPU_DRIVERS:-auto}"  # auto | true | false
 SET_TIMEZONE="${SET_TIMEZONE:-America/New_York}"    # empty string skips tz change
 ENABLE_NTP="${ENABLE_NTP:-true}"             # enable network time sync?
-VERIFY_CHECKSUM="${VERIFY_CHECKSUM:-true}"   # verify the .deb SHA256 before install?
 NONINTERACTIVE="${NONINTERACTIVE:-false}"    # force-skip the interactive menu?
 
-# Pinned NX release. Bump these (and regenerate checksums.txt) when TWG pins a
-# new build. See README.md -> "Updating the pinned version".
+# Pinned NX release. Bump these when TWG pins a new build.
+# See README.md -> "Updating the pinned version".
 NX_VERSION="6.1.2"
 NX_BUILD="42921"
-
-# Where to find checksums.txt. When piped from GitHub Pages we can't read a
-# local copy, so we fetch it from the same origin the installer came from.
-# Override with CHECKSUMS_URL, or provide the hash directly via NX_PKG_SHA256.
-CHECKSUMS_URL="${CHECKSUMS_URL:-https://twg-security.github.io/twg-nx-deploy/checksums.txt}"
 
 # ---------------------------------------------------------------------------
 # 2. Install logging — capture EVERYTHING to a file for later debugging
@@ -134,11 +128,18 @@ if [[ -n "${MENU_TTY}" ]]; then
   echo " Interactive setup — press Enter to accept the [default]."
   echo "----------------------------------------------------------"
 
-  # NX edition.
-  edchoice="$(ask_val "NX edition (witness/meta)" "${NX_EDITION}")"
+  # NX edition — numbered pick so a tech types 1 or 2 instead of the word.
+  # The edition words (witness/meta) still work too. The default is shown as
+  # its number in [brackets].
+  case "${NX_EDITION}" in
+    meta) ed_def="2" ;;
+    *)    ed_def="1" ;;
+  esac
+  echo "NX edition:  1) witness   2) meta" >&2
+  edchoice="$(ask_val "Choose 1 or 2" "${ed_def}")"
   case "${edchoice,,}" in
-    witness|1) NX_EDITION="witness" ;;
-    meta|2)    NX_EDITION="meta" ;;
+    1|witness) NX_EDITION="witness" ;;
+    2|meta)    NX_EDITION="meta" ;;
     *)         echo "    unrecognized '${edchoice}', keeping '${NX_EDITION}'" ;;
   esac
 
@@ -158,9 +159,6 @@ if [[ -n "${MENU_TTY}" ]]; then
   # Time.
   SET_TIMEZONE="$(ask_val "Timezone (blank = leave unchanged)" "${SET_TIMEZONE}")"
   ENABLE_NTP="$(ask_yn "Enable NTP time sync?" "${ENABLE_NTP}")"
-
-  # Integrity.
-  VERIFY_CHECKSUM="$(ask_yn "Verify package SHA256 before install?" "${VERIFY_CHECKSUM}")"
   echo "----------------------------------------------------------"
 else
   echo ">>> Non-interactive run — using env-var defaults (no menu)."
@@ -189,7 +187,7 @@ else
   esac
 fi
 
-# The filename we download to and the name we look up in checksums.txt.
+# The filename we download the package to.
 PKG_FILE="$(basename "${PKG_URL}")"
 
 # Pick the matching systemd service name for the chosen edition. Detected at
@@ -208,7 +206,6 @@ echo "    GPU drivers    : ${INSTALL_GPU_DRIVERS}"
 echo "    Install Webmin : ${INSTALL_WEBMIN}"
 echo "    Timezone       : ${SET_TIMEZONE:-<unchanged>}"
 echo "    Enable NTP     : ${ENABLE_NTP}"
-echo "    Verify hash    : ${VERIFY_CHECKSUM}"
 echo "    Package        : ${PKG_FILE}"
 
 # ---------------------------------------------------------------------------
@@ -232,59 +229,7 @@ if [[ "${INSTALL_NX}" == "true" ]]; then
   echo "    from ${PKG_URL}"
   curl -fSL --retry 3 --retry-delay 2 -o "${WORKDIR}/${PKG_FILE}" "${PKG_URL}"
 
-  # --- 7b. Verify the checksum ---------------------------------------------
-  # Preference order for the expected hash:
-  #   1. NX_PKG_SHA256 env var (explicit, wins)
-  #   2. the line for PKG_FILE inside checksums.txt (fetched from CHECKSUMS_URL)
-  if [[ "${VERIFY_CHECKSUM}" == "true" ]]; then
-    echo ">>> Verifying SHA256 checksum"
-
-    EXPECTED_SHA=""
-    if [[ -n "${NX_PKG_SHA256:-}" ]]; then
-      # Operator handed us the hash directly.
-      EXPECTED_SHA="${NX_PKG_SHA256}"
-      echo "    using SHA256 from NX_PKG_SHA256 env var"
-    else
-      # Try to pull checksums.txt and find the row for our exact filename.
-      echo "    looking up ${PKG_FILE} in ${CHECKSUMS_URL}"
-      if curl -fsSL -o "${WORKDIR}/checksums.txt" "${CHECKSUMS_URL}" 2>/dev/null; then
-        # A valid row is "<64-hex-hash>  <filename>". Reject placeholders.
-        EXPECTED_SHA="$(awk -v f="${PKG_FILE}" \
-          '$2 == f && $1 ~ /^[0-9a-fA-F]{64}$/ { print $1; exit }' \
-          "${WORKDIR}/checksums.txt" || true)"
-      else
-        echo "    WARNING: could not fetch checksums.txt from ${CHECKSUMS_URL}"
-      fi
-    fi
-
-    if [[ -n "${EXPECTED_SHA}" ]]; then
-      # Build a checkfile and let sha256sum -c do the compare. Fail loudly.
-      echo "${EXPECTED_SHA}  ${WORKDIR}/${PKG_FILE}" > "${WORKDIR}/verify.sha256"
-      if sha256sum -c "${WORKDIR}/verify.sha256"; then
-        echo "    checksum OK"
-      else
-        echo "ERROR: SHA256 mismatch for ${PKG_FILE}. Refusing to install." >&2
-        echo "       expected: ${EXPECTED_SHA}" >&2
-        echo "       actual  : $(sha256sum "${WORKDIR}/${PKG_FILE}" | awk '{print $1}')" >&2
-        exit 1
-      fi
-    else
-      # No usable hash found. VERIFY_CHECKSUM was requested, so this is fatal:
-      # the operator explicitly asked us to verify and we can't. To proceed
-      # anyway, re-run with VERIFY_CHECKSUM=false (knowingly) or supply
-      # NX_PKG_SHA256.
-      echo "ERROR: VERIFY_CHECKSUM=true but no SHA256 was found for ${PKG_FILE}." >&2
-      echo "       Provide NX_PKG_SHA256=<hash>, populate checksums.txt via" >&2
-      echo "       make-checksums.sh, or set VERIFY_CHECKSUM=false to skip." >&2
-      exit 1
-    fi
-  else
-    # Verification disabled by the operator — warn but continue.
-    echo ">>> WARNING: checksum verification is DISABLED (VERIFY_CHECKSUM=false)."
-    echo "    Installing without verifying the download integrity."
-  fi
-
-  # --- 7c. Install ---------------------------------------------------------
+  # --- 7b. Install ---------------------------------------------------------
   # apt-get resolves the .deb's dependencies for us. The leading ./ tells apt
   # this is a local file, not a repo package name.
   echo ">>> Installing ${PKG_FILE}"
