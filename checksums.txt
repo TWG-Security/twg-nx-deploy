@@ -1,0 +1,16 @@
+# TWG Security — NX package checksums
+# NX 6.1.2 build 42921
+#
+# PLACEHOLDER — the lines below are NOT real hashes. Before enabling
+# VERIFY_CHECKSUM=true in production you MUST generate real SHA256 sums:
+#
+#     ./make-checksums.sh
+#
+# That downloads both pinned .deb packages and overwrites this file with
+# genuine `sha256sum`-format rows (hash + filename). install.sh only trusts
+# a row whose first field is a 64-hex-character hash, so these placeholder
+# rows are intentionally ignored until replaced.
+#
+# format: <sha256>  <filename>
+REPLACE_WITH_REAL_SHA256  nxwitness-server-6.1.2.42921-linux_x64.deb
+REPLACE_WITH_REAL_SHA256  metavms-server-6.1.2.42921-linux_x64.deb
