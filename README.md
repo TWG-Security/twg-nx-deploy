@@ -18,6 +18,52 @@ Copy, paste, run on the server:
 curl -fsSL https://twg-security.github.io/twg-nx-deploy/install.sh | sudo bash
 ```
 
+> **First time using this repo? Two quick one-time setup steps must be done
+> before the command above works — see [section 0](#0-one-time-setup-do-this-first).**
+> After that's done once, the one-liner above is all any tech ever runs.
+
+---
+
+## 0. One-time setup (do this first)
+
+These two steps only need doing **once, by a maintainer**. After that the
+one-liner in section 1 works for everyone, forever.
+
+**Step 1 — Turn on the website that serves the installer.**
+Without this you get a **404** at the install URL.
+- Go to the repo on GitHub → **Settings → Pages**.
+- Under **Source**, choose **GitHub Actions**. Save.
+- That's it — a deploy runs automatically and the install URL goes live in a
+  minute or two. (Check **Actions → Deploy to GitHub Pages** for a green run.)
+
+**Step 2 — Generate the safety fingerprints.**
+The installer verifies the download hasn't been tampered with by checking its
+SHA256 "fingerprint." The repo ships with **placeholder** fingerprints, so
+until you generate the real ones a normal install **stops on purpose** with a
+checksum error (it refuses to install something it can't verify).
+
+Run this once on any Linux box with internet (it downloads the packages and
+writes the real fingerprints), then commit the result:
+
+```bash
+./make-checksums.sh
+git add checksums.txt && git commit -m "Add real NX package checksums" && git push
+```
+
+<details>
+<summary><b>In a hurry and can't do Step 2 right now?</b></summary>
+
+You can install **today** by telling the script to skip the fingerprint check.
+This trades away the tamper-check, so only do it knowingly:
+
+```bash
+curl -fsSL https://twg-security.github.io/twg-nx-deploy/install.sh | sudo VERIFY_CHECKSUM=false bash
+```
+
+The proper fix is Step 2 above — do it when you can so every future install is
+verified automatically.
+</details>
+
 **What that does by default:**
 
 - Installs **NX Witness 6.1.2 (build 42921)**
@@ -195,13 +241,20 @@ are what you expect.
 - **`.nojekyll`** — tells GitHub Pages to serve files as-is from the repo root.
 
 ### GitHub Pages
-Served **from the repository root** on the default branch. Because `.nojekyll`
-is present, `install.sh` and `checksums.txt` are reachable directly:
+Deployed by the **`.github/workflows/pages.yml`** GitHub Action, which uploads
+the repository root and publishes it. Because `.nojekyll` is present,
+`install.sh` and `checksums.txt` are served verbatim:
 
 - `https://twg-security.github.io/twg-nx-deploy/install.sh`
 - `https://twg-security.github.io/twg-nx-deploy/checksums.txt`
 
-Enable under **Settings → Pages → Deploy from a branch**, root folder.
+Enable once under **Settings → Pages → Source → GitHub Actions** (see
+[section 0](#0-one-time-setup-do-this-first)). After that, every push to the
+default branch that changes a served file redeploys automatically; you can also
+trigger a redeploy from **Actions → Deploy to GitHub Pages → Run workflow**.
+
+> Don't also set "Deploy from a branch" — the two sources are mutually
+> exclusive. This repo uses **GitHub Actions**.
 
 ### Updating the pinned NX version
 1. Update `NX_VERSION` and `NX_BUILD` in **both** `install.sh` and
@@ -213,6 +266,8 @@ Enable under **Settings → Pages → Deploy from a branch**, root folder.
 3. Commit `install.sh`, `make-checksums.sh`, and `checksums.txt` together.
 
 > **Important:** `checksums.txt` currently ships **placeholder** hashes. Until
-> you run `make-checksums.sh`, a default install (with `VERIFY_CHECKSUM=true`)
-> will **stop with an error** instead of installing an unverified package —
-> this is intentional. Generate the real hashes before production use.
+> you run `make-checksums.sh` (Step 2 in
+> [section 0](#0-one-time-setup-do-this-first)), a default install (with
+> `VERIFY_CHECKSUM=true`) will **stop with an error** instead of installing an
+> unverified package — this is intentional. Generate the real hashes before
+> production use.
