@@ -4,7 +4,14 @@
 # ------------------------------------------------
 # Provisions a fresh Ubuntu/Debian server with the Network Optix NX
 # mediaserver (Witness or Meta), plus optional Webmin, GPU drivers, timezone,
-# and NTP. Everything is logged to a file for later debugging.
+# and NTP.
+#
+# The SCREEN shows a clean, branded status interface (one line per step, a
+# spinner while it runs, a ✔/✖ when it finishes). The noisy apt/dpkg/curl
+# output no longer scrolls past — it's tucked into a full plain-text LOG FILE
+# for later debugging. Think of it like an airline departure board: the board
+# shows "Boarding / Departed"; the full flight manifest lives in the back
+# office (the log).
 #
 # Usage (as root):
 #   curl -fsSL https://twg-security.github.io/twg-nx-deploy/install.sh | sudo bash
@@ -16,20 +23,214 @@
 # options; pass NONINTERACTIVE=true (or run with no TTY, e.g. plain curl|bash
 # in automation) to skip the menu and use the env-var defaults.
 #
+# Honors NO_COLOR (https://no-color.org): set it to force plain output.
+#
 # This file is PUBLIC. No secrets, license keys, or internal hostnames live here.
 
 set -euo pipefail
 
+# ===========================================================================
+# UI toolkit — colors, glyphs, banner, and the step/spinner engine
+# ===========================================================================
+# Defined first so even the earliest error (e.g. "not root") is presented in
+# the same branded style as everything else.
+#
+# We only turn on colors/spinners when stdout is a real terminal (not a pipe
+# or file), TERM isn't "dumb", and the operator hasn't set NO_COLOR. In every
+# other case (CI, cron, redirected output) we fall back to plain text so logs
+# stay readable and nothing emits stray escape codes.
+if [[ -t 1 ]] && [[ "${TERM:-dumb}" != "dumb" ]] && [[ -z "${NO_COLOR:-}" ]]; then
+  UI=true
+else
+  UI=false
+fi
+
+# Fancy box-drawing / braille glyphs need a UTF-8 terminal. If the locale isn't
+# UTF-8 we keep the color but swap to plain ASCII glyphs so nothing renders as
+# garbage question-marks.
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+  *[Uu][Tt][Ff]*8* | *[Uu][Tt][Ff]8*) UTF8=true ;;
+  *) UTF8=false ;;
+esac
+
+# TWG Security brand palette (24-bit truecolor):
+#   primary red  #C0392B   dark charcoal #1A1A1A   white #FFFFFF
+# Charcoal is near-black, so we use it only as a banner background; on-screen
+# secondary text uses a dim grey that stays readable on any theme.
+if $UI; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+  C_RED=$'\033[38;2;192;57;43m'          # TWG red, foreground
+  C_REDBG=$'\033[48;2;192;57;43m'        # TWG red, background
+  C_CHARBG=$'\033[48;2;26;26;26m'        # TWG charcoal, background
+  C_WHITE=$'\033[38;2;255;255;255m'
+  C_GREY=$'\033[38;2;150;150;150m'
+  C_GREEN=$'\033[38;2;46;160;67m'
+  C_YELLOW=$'\033[38;2;214;153;33m'
+  CR=$'\r'; CLR=$'\033[K'; HIDE=$'\033[?25l'; SHOW=$'\033[?25h'
+else
+  C_RESET=''; C_BOLD=''; C_DIM=''; C_RED=''; C_REDBG=''; C_CHARBG=''
+  C_WHITE=''; C_GREY=''; C_GREEN=''; C_YELLOW=''
+  CR=''; CLR=''; HIDE=''; SHOW=''
+fi
+
+# Glyphs (UTF-8 vs ASCII fallback).
+if $UTF8; then
+  G_OK='✔'; G_BAD='✖'; G_WARN='⚠'; G_BAR='▍'; G_ARROW='▶'; G_DOT='•'
+  SPIN=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+else
+  G_OK='OK'; G_BAD='XX'; G_WARN='!!'; G_BAR='|'; G_ARROW='>'; G_DOT='-'
+  SPIN=('|' '/' '-' '\')
+fi
+
+# LOG_FILE is finalized in the logging section below; declare it early so the
+# helpers can reference it safely even before it exists.
+LOG_FILE=""
+
+# logline: append a timestamped plain-text line to the log file (no color).
+# Safe to call before the log exists — it just no-ops until LOG_FILE is set.
+logline() {
+  [[ -n "${LOG_FILE}" ]] || return 0
+  printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "${LOG_FILE}" 2>/dev/null || true
+}
+
+# section: a titled divider. On screen it's a red tick + bold title; in the log
+# it's a plain "=== Title ===" header.
+section() {
+  if $UI; then
+    printf '\n  %s%s%s %s%s%s\n' "$C_RED" "$G_BAR" "$C_RESET" "$C_BOLD" "$1" "$C_RESET"
+  else
+    printf '\n== %s ==\n' "$1"
+  fi
+  logline "=== $1 ==="
+}
+
+# kv: aligned key / value line, for the plan and summary cards.
+kv() {
+  if $UI; then
+    printf '    %s%-15s%s %s\n' "$C_GREY" "$1" "$C_RESET" "$2"
+  else
+    printf '    %-15s %s\n' "$1" "$2"
+  fi
+  logline "    $1: $2"
+}
+
+# note: a dim, indented secondary line (context that isn't a pass/fail).
+note() {
+  if $UI; then
+    printf '    %s%s %s%s\n' "$C_DIM" "$G_DOT" "$1" "$C_RESET"
+  else
+    printf '    %s %s\n' "$G_DOT" "$1"
+  fi
+  logline "    - $1"
+}
+
+# ok / warn: a green success line / a yellow non-fatal warning.
+ok()   { if $UI; then printf '    %s%s%s %s\n' "$C_GREEN" "$G_OK" "$C_RESET" "$1"; else printf '    %s %s\n' "$G_OK" "$1"; fi; logline "    OK: $1"; }
+warn() { if $UI; then printf '    %s%s %s%s\n' "$C_YELLOW" "$G_WARN" "$1" "$C_RESET"; else printf '    %s %s\n' "$G_WARN" "$1"; fi; logline "    WARN: $1"; }
+
+# die: fatal error — restore the cursor, print a red banner, point at the log,
+# and exit non-zero. Used for anything we cannot recover from.
+die() {
+  $UI && printf '%s' "$SHOW"
+  if $UI; then
+    printf '\n  %s%s ERROR %s %s%s\n' "$C_REDBG$C_WHITE$C_BOLD" '' "$C_RESET" "$C_RED" "$1"
+    printf '%s' "$C_RESET"
+  else
+    printf '\nERROR: %s\n' "$1" >&2
+  fi
+  logline "FATAL: $1"
+  [[ -n "${LOG_FILE}" ]] && printf '  %sSee the full log: %s%s\n' "$C_DIM" "${LOG_FILE}" "$C_RESET" >&2
+  exit 1
+}
+
+# dump_tail: on a step failure, show the last few log lines so the operator
+# isn't forced to open the file to see what broke.
+dump_tail() {
+  [[ -n "${LOG_FILE}" && -f "${LOG_FILE}" ]] || return 0
+  printf '    %s---- last log lines ----%s\n' "$C_DIM" "$C_RESET"
+  tail -n 8 "${LOG_FILE}" 2>/dev/null | sed "s/^/    ${C_DIM}/;s/$/${C_RESET}/" || true
+}
+
+# step: run a command as one unit of work with a live status line.
+#   step "Human description" my_command arg1 arg2
+# All of the command's stdout+stderr is captured to the log file only, keeping
+# the screen clean. In UI mode a spinner animates with an elapsed-seconds
+# counter; on finish the line is rewritten to ✔ (green) or ✖ (red). In plain
+# mode it prints a simple start/done/FAILED marker. Returns the command's exit
+# code so the caller can decide whether a failure is fatal or best-effort.
+step() {
+  local desc="$1"; shift
+  logline "STEP begin: ${desc}  (cmd: $*)"
+  local t0=$SECONDS rc=0
+
+  if ! $UI; then
+    printf '  %s %s ... ' "$G_ARROW" "${desc}"
+    if "$@" >> "${LOG_FILE}" 2>&1; then
+      printf 'done\n'
+    else
+      rc=$?; printf 'FAILED (exit %d)\n' "$rc"; dump_tail
+    fi
+    logline "STEP end: ${desc}  (rc=${rc}, ${SECONDS}s elapsed)"
+    return $rc
+  fi
+
+  # UI mode: run the work in the background and animate while it lives.
+  "$@" >> "${LOG_FILE}" 2>&1 &
+  local pid=$! i=0
+  printf '%s' "$HIDE"
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '%s  %s%s%s %s %s[%ds]%s%s' "$CR" \
+      "$C_RED" "${SPIN[i]}" "$C_RESET" "${desc}" "$C_DIM" "$((SECONDS - t0))" "$C_RESET" "$CLR"
+    i=$(((i + 1) % ${#SPIN[@]}))
+    sleep 0.1
+  done
+  if wait "$pid"; then rc=0; else rc=$?; fi
+  printf '%s' "$SHOW"
+
+  if [[ $rc -eq 0 ]]; then
+    printf '%s  %s%s%s %s %s[%ds]%s%s\n' "$CR" \
+      "$C_GREEN" "$G_OK" "$C_RESET" "${desc}" "$C_DIM" "$((SECONDS - t0))" "$C_RESET" "$CLR"
+  else
+    printf '%s  %s%s%s %s %s(exit %d)%s%s\n' "$CR" \
+      "$C_RED" "$G_BAD" "$C_RESET" "${desc}" "$C_DIM" "$rc" "$C_RESET" "$CLR"
+    dump_tail
+  fi
+  logline "STEP end: ${desc}  (rc=${rc}, $((SECONDS - t0))s elapsed)"
+  return $rc
+}
+
+# banner: the branded header. Block "TWG" art in TWG red when the terminal can
+# render it; a tidy plain header otherwise (and always in the log).
+banner() {
+  if $UI && $UTF8; then
+    printf '\n'
+    printf '  %s%s████████╗██╗    ██╗ ██████╗ %s\n'  "$C_BOLD" "$C_RED" "$C_RESET"
+    printf '  %s%s╚══██╔══╝██║    ██║██╔════╝ %s   %s%sTWG SECURITY%s\n'      "$C_BOLD" "$C_RED" "$C_RESET" "$C_BOLD" "$C_WHITE" "$C_RESET"
+    printf '  %s%s   ██║   ██║ █╗ ██║██║  ███╗%s   %s%sThe Wire Guys%s\n'     "$C_BOLD" "$C_RED" "$C_RESET" "$C_DIM" "$C_GREY" "$C_RESET"
+    printf '  %s%s   ██║   ██║███╗██║██║   ██║%s\n'  "$C_BOLD" "$C_RED" "$C_RESET"
+    printf '  %s%s   ██║   ╚███╔███╔╝╚██████╔╝%s   %sNX Mediaserver Deployment%s\n' "$C_BOLD" "$C_RED" "$C_RESET" "$C_GREY" "$C_RESET"
+    printf '  %s%s   ╚═╝    ╚══╝╚══╝  ╚═════╝ %s\n'  "$C_BOLD" "$C_RED" "$C_RESET"
+    printf '\n'
+  elif $UI; then
+    printf '\n  %s%s TWG SECURITY %s  %sNX Mediaserver Deployment%s\n' \
+      "$C_REDBG$C_WHITE$C_BOLD" '' "$C_RESET" "$C_GREY" "$C_RESET"
+    printf '  %sThe Wire Guys%s\n\n' "$C_DIM" "$C_RESET"
+  else
+    printf '\n==========================================================\n'
+    printf ' TWG Security - NX Mediaserver Deployment (The Wire Guys)\n'
+    printf '==========================================================\n\n'
+  fi
+}
+
 # ---------------------------------------------------------------------------
-# 0. Must run as root
+# Must run as root
 # ---------------------------------------------------------------------------
 # The mediaserver .deb installs a systemd service and writes to /opt, and GPU
-# driver install touches apt/system state, so we need real root. Bail
-# immediately with a readable message if we don't have it.
+# driver install touches apt/system state, so we need real root.
 if [[ "${EUID}" -ne 0 ]]; then
-  echo "ERROR: this installer must run as root. Re-run with sudo, e.g.:" >&2
-  echo "  curl -fsSL <url> | sudo bash" >&2
-  exit 1
+  banner
+  die "This installer must run as root. Re-run with sudo, e.g.:
+        curl -fsSL <url> | sudo bash"
 fi
 
 # ---------------------------------------------------------------------------
@@ -49,6 +250,11 @@ NONINTERACTIVE="${NONINTERACTIVE:-false}"    # force-skip the interactive menu?
 # See README.md -> "Updating the pinned version".
 NX_VERSION="6.1.2"
 NX_BUILD="42921"
+
+# Run-state flags, filled in as we go, used to build the closing summary.
+NX_DONE=false
+WEBMIN_DONE=false
+REBOOT_RECOMMENDED=false
 
 # ---------------------------------------------------------------------------
 # 1a. Force every apt/dpkg step to be truly non-interactive
@@ -83,41 +289,50 @@ export NEEDRESTART_SUSPEND=1
 # ---------------------------------------------------------------------------
 # 2. Install logging — capture EVERYTHING to a file for later debugging
 # ---------------------------------------------------------------------------
-# Timestamped log under /var/log by default; override with LOG_FILE. We route
-# all stdout+stderr through `tee` so output shows live on the console AND is
-# persisted. This is set up first so the menu and every step below are logged.
+# Timestamped log under /var/log by default; override with LOG_FILE. Unlike the
+# old build, we do NOT tee the whole world to the console — the pretty UI goes
+# to the screen and every command's raw output goes here to the file, so the
+# log is a complete, plain-text record of the run.
 LOG_TS="$(date +%Y%m%d-%H%M%S)"
 LOG_FILE="${LOG_FILE:-/var/log/twg-nx-deploy-${LOG_TS}.log}"
 mkdir -p "$(dirname "${LOG_FILE}")" 2>/dev/null || true
-# tee -a keeps appending if the file already exists (safe to re-run).
-exec > >(tee -a "${LOG_FILE}") 2>&1
+# Create/append the log and write a header block into it.
+{
+  echo "=========================================================="
+  echo " TWG Security — NX Mediaserver bootstrap"
+  echo " $(date)"
+  echo "=========================================================="
+} >> "${LOG_FILE}" 2>/dev/null || die "Cannot write to log file: ${LOG_FILE}"
 
-echo "=========================================================="
-echo " TWG Security — NX Mediaserver bootstrap"
-echo " $(date)"
-echo " Logging to: ${LOG_FILE}"
-echo "=========================================================="
+# Restore the cursor on ANY exit (success, error, Ctrl-C) so a killed spinner
+# never leaves the terminal without a cursor. Temp-dir cleanup is added to this
+# same trap once the workspace exists.
+trap 'printf "%s" "${SHOW}"' EXIT
 
-# Record system context up front so a debugger has it without asking.
-echo ">>> System info"
+# ---------------------------------------------------------------------------
+# 3. Show the banner and record system context
+# ---------------------------------------------------------------------------
+banner
+note "Logging to ${LOG_FILE}"
+
+section "System"
 . /etc/os-release 2>/dev/null || true
 DISTRO_ID="${ID:-unknown}"            # ubuntu | debian | ...
 DISTRO_LIKE="${ID_LIKE:-}"            # e.g. "debian"
-echo "    distro : ${PRETTY_NAME:-unknown} (id=${DISTRO_ID})"
-echo "    kernel : $(uname -r)"
-echo "    arch   : $(uname -m)"
-echo "    host   : $(hostname 2>/dev/null || echo unknown)"
+kv "Distro" "${PRETTY_NAME:-unknown} (id=${DISTRO_ID})"
+kv "Kernel" "$(uname -r)"
+kv "Arch"   "$(uname -m)"
+kv "Host"   "$(hostname 2>/dev/null || echo unknown)"
 
 # ---------------------------------------------------------------------------
-# 3. Confirm this is a Debian/Ubuntu box (we need apt-get)
+# 4. Confirm this is a Debian/Ubuntu box (we need apt-get)
 # ---------------------------------------------------------------------------
 if ! command -v apt-get >/dev/null 2>&1; then
-  echo "ERROR: apt-get not found. This installer supports Debian/Ubuntu only." >&2
-  exit 1
+  die "apt-get not found. This installer supports Debian/Ubuntu only."
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Interactive menu (only when a terminal is available)
+# 5. Interactive menu (only when a terminal is available)
 # ---------------------------------------------------------------------------
 # The one-liner pipes the script into bash, so stdin is the script — not the
 # keyboard. To prompt anyway we read from the controlling terminal /dev/tty.
@@ -135,7 +350,8 @@ fi
 ask_yn() {
   local prompt="$1" def="$2" ans hint
   if [[ "${def}" == "true" ]]; then hint="[Y/n]"; else hint="[y/N]"; fi
-  read -rp "${prompt} ${hint} " ans < "${MENU_TTY}" >&2 || ans=""
+  printf '    %s%s%s %s%s%s ' "$C_WHITE" "${prompt}" "$C_RESET" "$C_DIM" "${hint}" "$C_RESET" >&2
+  read -r ans < "${MENU_TTY}" || ans=""
   ans="${ans,,}"
   case "${ans}" in
     "")      echo "${def}" ;;
@@ -148,29 +364,29 @@ ask_yn() {
 # Prompt helper: free-text value with a default (blank input keeps default).
 ask_val() {
   local prompt="$1" def="$2" ans
-  read -rp "${prompt} [${def:-<empty>}] " ans < "${MENU_TTY}" >&2 || ans=""
+  printf '    %s%s%s %s[%s]%s ' "$C_WHITE" "${prompt}" "$C_RESET" "$C_DIM" "${def:-<empty>}" "$C_RESET" >&2
+  read -r ans < "${MENU_TTY}" || ans=""
   if [[ -z "${ans}" ]]; then echo "${def}"; else echo "${ans}"; fi
 }
 
 if [[ -n "${MENU_TTY}" ]]; then
-  echo ""
-  echo "----------------------------------------------------------"
-  echo " Interactive setup — press Enter to accept the [default]."
-  echo "----------------------------------------------------------"
+  section "Setup"
+  note "Press Enter to accept the [default] shown for each option."
+  printf '\n'
 
   # NX edition — numbered pick so a tech types 1 or 2 instead of the word.
-  # The edition words (witness/meta) still work too. The default is shown as
-  # its number in [brackets].
+  # The edition words (witness/meta) still work too.
   case "${NX_EDITION}" in
     meta) ed_def="2" ;;
     *)    ed_def="1" ;;
   esac
-  echo "NX edition:  1) witness   2) meta" >&2
+  printf '    %sNX edition:%s  %s1%s) witness   %s2%s) meta\n' \
+    "$C_WHITE" "$C_RESET" "$C_RED" "$C_RESET" "$C_RED" "$C_RESET" >&2
   edchoice="$(ask_val "Choose 1 or 2" "${ed_def}")"
   case "${edchoice,,}" in
     1|witness) NX_EDITION="witness" ;;
     2|meta)    NX_EDITION="meta" ;;
-    *)         echo "    unrecognized '${edchoice}', keeping '${NX_EDITION}'" ;;
+    *)         warn "Unrecognized '${edchoice}', keeping '${NX_EDITION}'." ;;
   esac
 
   # Toggles.
@@ -189,13 +405,12 @@ if [[ -n "${MENU_TTY}" ]]; then
   # Time.
   SET_TIMEZONE="$(ask_val "Timezone (blank = leave unchanged)" "${SET_TIMEZONE}")"
   ENABLE_NTP="$(ask_yn "Enable NTP time sync?" "${ENABLE_NTP}")"
-  echo "----------------------------------------------------------"
 else
-  echo ">>> Non-interactive run — using env-var defaults (no menu)."
+  note "Non-interactive run — using env-var defaults (no menu)."
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Resolve the package URL from the edition (unless explicitly overridden)
+# 6. Resolve the package URL from the edition (unless explicitly overridden)
 # ---------------------------------------------------------------------------
 # Done AFTER the menu so an edition change there is honored. Pinned download
 # URLs for NX 6.1.2 build 42921. If NX_PKG_URL is set we honor it verbatim and
@@ -210,10 +425,7 @@ else
   case "${NX_EDITION}" in
     witness) PKG_URL="${WITNESS_URL}" ;;
     meta)    PKG_URL="${META_URL}" ;;
-    *)
-      echo "ERROR: NX_EDITION must be 'witness' or 'meta' (got: '${NX_EDITION}')." >&2
-      exit 1
-      ;;
+    *)       die "NX_EDITION must be 'witness' or 'meta' (got: '${NX_EDITION}')." ;;
   esac
 fi
 
@@ -227,40 +439,43 @@ case "${NX_EDITION}" in
   *)    SERVICE_HINT="networkoptix-mediaserver" ;;
 esac
 
-# Echo the effective plan (post-menu) so the log records exactly what ran.
-echo ">>> Effective configuration"
-echo "    Edition        : ${NX_EDITION}"
-echo "    NX version     : ${NX_VERSION} build ${NX_BUILD}"
-echo "    Install NX     : ${INSTALL_NX}"
-echo "    GPU drivers    : ${INSTALL_GPU_DRIVERS}"
-echo "    Install Webmin : ${INSTALL_WEBMIN}"
-echo "    Timezone       : ${SET_TIMEZONE:-<unchanged>}"
-echo "    Enable NTP     : ${ENABLE_NTP}"
-echo "    Package        : ${PKG_FILE}"
+# ---------------------------------------------------------------------------
+# 7. Show the effective plan (post-menu) so it's clear what's about to run
+# ---------------------------------------------------------------------------
+section "Deployment plan"
+kv "Edition"    "NX ${NX_EDITION^}"
+kv "Version"    "${NX_VERSION} build ${NX_BUILD}"
+kv "Install NX" "${INSTALL_NX}"
+kv "GPU drivers" "${INSTALL_GPU_DRIVERS}"
+kv "Webmin"     "${INSTALL_WEBMIN}"
+kv "Timezone"   "${SET_TIMEZONE:-<unchanged>}"
+kv "NTP"        "${ENABLE_NTP}"
+kv "Package"    "${PKG_FILE}"
 
 # ---------------------------------------------------------------------------
-# 6. Temp workspace with guaranteed cleanup
+# 8. Temp workspace with guaranteed cleanup
 # ---------------------------------------------------------------------------
 # Download into a private temp dir and remove it on any exit (success, error,
-# or Ctrl-C) via a trap so we never leave stray .deb files behind.
+# or Ctrl-C). We fold the removal into the existing cursor-restore trap.
 WORKDIR="$(mktemp -d)"
-cleanup() {
-  rm -rf "${WORKDIR}"
-}
-trap cleanup EXIT
+trap 'printf "%s" "${SHOW}"; rm -rf "${WORKDIR}"' EXIT
 
 # ===========================================================================
-# 7. NX mediaserver install
+# 9. NX mediaserver install
 # ===========================================================================
 if [[ "${INSTALL_NX}" == "true" ]]; then
+  section "NX mediaserver"
+  note "Edition: NX ${NX_EDITION^} ${NX_VERSION} (build ${NX_BUILD})"
 
-  # --- 7a. Download the .deb -----------------------------------------------
-  echo ">>> Downloading ${PKG_FILE}"
-  echo "    from ${PKG_URL}"
-  curl -fSL --retry 3 --retry-delay 2 -o "${WORKDIR}/${PKG_FILE}" "${PKG_URL}"
+  # --- 9a. Download the .deb -----------------------------------------------
+  if ! step "Downloading ${PKG_FILE}" \
+      curl -fSL --retry 3 --retry-delay 2 -o "${WORKDIR}/${PKG_FILE}" "${PKG_URL}"; then
+    die "Failed to download the NX package from:
+        ${PKG_URL}"
+  fi
 
-  # --- 7b. Install ---------------------------------------------------------
-  # apt-get resolves the .deb's dependencies for us. The leading ./ tells apt
+  # --- 9b. Install ---------------------------------------------------------
+  # apt-get resolves the .deb's dependencies for us. The leading path tells apt
   # this is a local file, not a repo package name. The Dpkg::Options keep the
   # install unattended even if a config-file conflict comes up: keep the
   # existing conffile (confold) and fall back to the package default when
@@ -268,23 +483,26 @@ if [[ "${INSTALL_NX}" == "true" ]]; then
   # with DEBIAN_FRONTEND=noninteractive (set at the top) this guarantees the
   # mediaserver postinst never blocks on that whiptail "Complete the setup"
   # note that hangs headless/remote runs.
-  echo ">>> Installing ${PKG_FILE}"
-  apt-get update -y
-  apt-get install -y \
-    -o Dpkg::Options::="--force-confdef" \
-    -o Dpkg::Options::="--force-confold" \
-    "${WORKDIR}/${PKG_FILE}"
-  echo "    NX mediaserver installed."
-  echo "    NOTE: the server is installed but NOT yet set up. Finish setup in"
-  echo "          the Nx client via the 'New Site' tile, or open the server's"
-  echo "          web page at http://<server-ip>:7001 in a browser."
+  step "Refreshing apt package index" apt-get update -y || true
+  if ! step "Installing ${PKG_FILE}" \
+      apt-get install -y \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
+        "${WORKDIR}/${PKG_FILE}"; then
+    die "NX mediaserver install failed. See the log for apt's output."
+  fi
 
+  NX_DONE=true
+  ok "NX mediaserver installed."
+  note "The server is installed but NOT yet set up. Finish setup in the Nx"
+  note "client via the 'New Site' tile, or open http://<server-ip>:7001."
 else
-  echo ">>> Skipping NX install (INSTALL_NX=${INSTALL_NX})."
+  section "NX mediaserver"
+  note "Skipped (INSTALL_NX=${INSTALL_NX})."
 fi
 
 # ===========================================================================
-# 8. GPU detection + driver install
+# 10. GPU detection + driver install
 # ===========================================================================
 # Detects an installed GPU and installs the vendor-appropriate drivers so NX
 # can use hardware-accelerated decoding. INSTALL_GPU_DRIVERS:
@@ -293,23 +511,23 @@ fi
 #   true  -> same as auto (kept as an explicit "yes")
 # GPU setup is an enhancement, not core provisioning, so failures here WARN
 # and continue rather than aborting the whole run.
+section "GPU drivers"
 if [[ "${INSTALL_GPU_DRIVERS}" != "false" ]]; then
-  echo ">>> GPU detection"
 
   # lspci (pciutils) is how we enumerate hardware; install it if missing.
   if ! command -v lspci >/dev/null 2>&1; then
-    echo "    installing pciutils (for lspci)"
-    apt-get install -y pciutils || echo "    WARNING: could not install pciutils; GPU detection may be limited."
+    step "Installing pciutils (for lspci)" apt-get install -y pciutils \
+      || warn "Could not install pciutils; GPU detection may be limited."
   fi
 
   # Grab display-class devices (VGA / 3D / Display controllers).
   GPU_LINES="$(lspci -nn 2>/dev/null | grep -Ei 'vga|3d controller|display controller' || true)"
 
   if [[ -z "${GPU_LINES}" ]]; then
-    echo "    no GPU detected — skipping driver install."
+    note "No GPU detected — skipping driver install."
   else
-    echo "    detected:"
-    echo "${GPU_LINES}" | sed 's/^/      /'
+    note "Detected:"
+    while IFS= read -r line; do [[ -n "$line" ]] && note "  ${line}"; done <<<"${GPU_LINES}"
 
     # Classify by vendor (case-insensitive match on the lspci text).
     HAS_NVIDIA=false; HAS_AMD=false; HAS_INTEL=false
@@ -325,145 +543,171 @@ if [[ "${INSTALL_GPU_DRIVERS}" != "false" ]]; then
       IS_UBUNTU=true
     fi
 
-    apt-get update -y || true
+    step "Refreshing apt package index" apt-get update -y || true
 
     # --- NVIDIA ------------------------------------------------------------
     if [[ "${HAS_NVIDIA}" == "true" ]]; then
-      echo ">>> NVIDIA GPU — installing drivers"
+      note "NVIDIA GPU detected."
       if [[ "${IS_UBUNTU}" == "true" ]]; then
         # ubuntu-drivers picks the recommended (latest stable) driver for the
         # exact card — the vendor-blessed path on Ubuntu.
-        if apt-get install -y ubuntu-drivers-common; then
-          echo "    recommended drivers per ubuntu-drivers:"
-          ubuntu-drivers devices 2>/dev/null | sed 's/^/      /' || true
-          if ubuntu-drivers install; then
-            echo "    NVIDIA driver installed (ubuntu-drivers)."
+        if step "Installing ubuntu-drivers-common" apt-get install -y ubuntu-drivers-common; then
+          if step "Installing recommended NVIDIA driver" ubuntu-drivers install; then
+            REBOOT_RECOMMENDED=true
+          elif step "Retry: ubuntu-drivers autoinstall" ubuntu-drivers autoinstall; then
+            REBOOT_RECOMMENDED=true
           else
-            echo "    WARNING: 'ubuntu-drivers install' failed; trying autoinstall."
-            ubuntu-drivers autoinstall || echo "    WARNING: NVIDIA driver install failed — install manually."
+            warn "NVIDIA driver install failed — install manually."
           fi
         else
-          echo "    WARNING: could not install ubuntu-drivers-common — skipping NVIDIA."
+          warn "Could not install ubuntu-drivers-common — skipping NVIDIA."
         fi
       else
         # Debian: the NVIDIA driver lives in contrib/non-free, which may not be
         # enabled. Attempt it, and if it fails point the tech at the manual fix
         # rather than silently mangling their apt sources.
-        echo "    Debian detected — attempting nvidia-driver from contrib/non-free."
-        if apt-get install -y nvidia-driver; then
-          echo "    NVIDIA driver installed."
+        if step "Installing nvidia-driver (Debian contrib/non-free)" apt-get install -y nvidia-driver; then
+          REBOOT_RECOMMENDED=true
         else
-          echo "    WARNING: nvidia-driver unavailable. Enable 'contrib non-free"
-          echo "             non-free-firmware' in /etc/apt/sources.list, run"
-          echo "             'apt-get update', then 'apt-get install nvidia-driver'."
+          warn "nvidia-driver unavailable. Enable 'contrib non-free"
+          warn "non-free-firmware' in /etc/apt/sources.list, run 'apt-get"
+          warn "update', then 'apt-get install nvidia-driver'."
         fi
       fi
-      # Report GPU state if the tool is present now.
-      command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi || true
-      echo "    NOTE: a reboot is recommended so the NVIDIA kernel module loads."
     fi
 
     # --- AMD ---------------------------------------------------------------
     if [[ "${HAS_AMD}" == "true" ]]; then
-      echo ">>> AMD GPU — installing Mesa VAAPI drivers"
       # The amdgpu kernel driver ships in-kernel; add Mesa's VAAPI stack for
       # hardware video decode plus vainfo to check it.
-      apt-get install -y mesa-va-drivers vainfo \
-        || echo "    WARNING: AMD VAAPI packages failed to install."
+      step "Installing AMD Mesa VAAPI drivers" apt-get install -y mesa-va-drivers vainfo \
+        || warn "AMD VAAPI packages failed to install."
     fi
 
     # --- Intel -------------------------------------------------------------
     if [[ "${HAS_INTEL}" == "true" ]]; then
-      echo ">>> Intel GPU — installing VAAPI drivers"
       # i965 (older) + intel-media (Gen8+) VAAPI drivers cover the common range.
-      apt-get install -y intel-media-va-driver i965-va-driver vainfo \
-        || echo "    WARNING: Intel VAAPI packages failed to install."
+      step "Installing Intel VAAPI drivers" apt-get install -y intel-media-va-driver i965-va-driver vainfo \
+        || warn "Intel VAAPI packages failed to install."
     fi
 
-    echo "    GPU driver step complete."
+    ok "GPU driver step complete."
   fi
 else
-  echo ">>> Skipping GPU driver install (INSTALL_GPU_DRIVERS=false)."
+  note "Skipped (INSTALL_GPU_DRIVERS=false)."
 fi
 
 # ===========================================================================
-# 9. Webmin (optional)
+# 11. Webmin (optional)
 # ===========================================================================
 # Only runs when explicitly enabled. Adds Webmin's signed apt repo and installs
 # it. Re-running is safe: the key/repo files are simply overwritten.
+section "Webmin"
 if [[ "${INSTALL_WEBMIN}" == "true" ]]; then
-  echo ">>> Installing Webmin"
 
-  # Tooling Webmin's repo setup needs.
-  apt install -y software-properties-common apt-transport-https curl
+  # Composite step: everything Webmin's repo setup + install needs, as one unit
+  # of work. Wrapped in a function so the spinner treats it atomically.
+  install_webmin() {
+    apt-get install -y software-properties-common apt-transport-https curl
+    curl -fsSL https://download.webmin.com/developers-key.asc \
+      | gpg --dearmor -o /usr/share/keyrings/webmin.gpg
+    echo "deb [signed-by=/usr/share/keyrings/webmin.gpg] https://download.webmin.com/download/newkey/repository stable contrib" \
+      > /etc/apt/sources.list.d/webmin.list
+    apt-get update -y
+    apt-get install -y webmin
+  }
 
-  # Import Webmin's signing key into a dedicated keyring.
-  curl -fsSL https://download.webmin.com/developers-key.asc | gpg --dearmor -o /usr/share/keyrings/webmin.gpg
-
-  # Register the signed repository.
-  echo "deb [signed-by=/usr/share/keyrings/webmin.gpg] https://download.webmin.com/download/newkey/repository stable contrib" > /etc/apt/sources.list.d/webmin.list
-
-  # Install Webmin from the freshly-added repo.
-  apt update && apt install -y webmin
-
-  # Best-effort local IP for the access hint (falls back to a placeholder).
-  SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  SERVER_IP="${SERVER_IP:-<server-ip>}"
-  echo "    Webmin installed. Access it at: https://${SERVER_IP}:10000"
+  if step "Adding Webmin repo and installing" install_webmin; then
+    WEBMIN_DONE=true
+    ok "Webmin installed."
+  else
+    warn "Webmin install failed — see the log."
+  fi
 else
-  echo ">>> Skipping Webmin install (INSTALL_WEBMIN=${INSTALL_WEBMIN})."
+  note "Skipped (INSTALL_WEBMIN=${INSTALL_WEBMIN})."
 fi
 
 # ===========================================================================
-# 10. Time: timezone, NTP, hardware clock
+# 12. Time: timezone, NTP, hardware clock
 # ===========================================================================
-echo ">>> Configuring time"
+section "Time"
 
 # Set the timezone only when a non-empty value is provided.
 if [[ -n "${SET_TIMEZONE}" ]]; then
-  echo "    setting timezone to ${SET_TIMEZONE}"
-  timedatectl set-timezone "${SET_TIMEZONE}"
+  step "Setting timezone to ${SET_TIMEZONE}" timedatectl set-timezone "${SET_TIMEZONE}" \
+    || warn "Failed to set timezone."
 else
-  echo "    SET_TIMEZONE empty — leaving timezone unchanged."
+  note "SET_TIMEZONE empty — leaving timezone unchanged."
 fi
 
 # Enable network time synchronization when requested.
 if [[ "${ENABLE_NTP}" == "true" ]]; then
-  echo "    enabling NTP (network time sync)"
-  timedatectl set-ntp true
+  step "Enabling NTP (network time sync)" timedatectl set-ntp true \
+    || warn "Failed to enable NTP."
 else
-  echo "    ENABLE_NTP=${ENABLE_NTP} — leaving NTP state unchanged."
+  note "ENABLE_NTP=${ENABLE_NTP} — leaving NTP state unchanged."
 fi
 
 # Always sync the hardware (RTC) clock from the now-correct system clock.
-echo "    syncing hardware clock (hwclock --systohc)"
-hwclock --systohc || echo "    WARNING: hwclock --systohc failed (common on VMs/containers without an RTC)."
+step "Syncing hardware clock (hwclock --systohc)" hwclock --systohc \
+  || warn "hwclock --systohc failed (common on VMs/containers without an RTC)."
 
-echo ">>> Current time settings:"
-timedatectl
+# Show the key settings concisely; the full timedatectl dump goes to the log.
+timedatectl >> "${LOG_FILE}" 2>&1 || true
+TZ_NOW="$(timedatectl show -p Timezone --value 2>/dev/null || echo unknown)"
+NTP_NOW="$(timedatectl show -p NTP --value 2>/dev/null || echo unknown)"
+note "Timezone: ${TZ_NOW}   NTP: ${NTP_NOW}"
 
 # ===========================================================================
-# 11. Report the mediaserver service status
+# 13. Report the mediaserver service status
 # ===========================================================================
 # Detect the actual installed *mediaserver* unit rather than hardcoding it, so
 # this stays correct across editions and future naming tweaks.
+SERVICE_NAME=""
+SERVICE_STATE=""
 if [[ "${INSTALL_NX}" == "true" ]]; then
-  echo ">>> NX mediaserver service status"
+  section "Service status"
 
   # List loaded units and grab the first one whose name contains 'mediaserver'.
   SERVICE_NAME="$(systemctl list-units --type=service --all --no-legend 2>/dev/null \
     | awk '{print $1}' | grep -m1 'mediaserver' || true)"
-
   # Fall back to the edition-based hint if enumeration found nothing.
   SERVICE_NAME="${SERVICE_NAME:-${SERVICE_HINT}.service}"
 
-  echo "    service: ${SERVICE_NAME}"
-  # --no-pager keeps output flowing when piped; don't let a non-zero status
-  # (e.g. service not yet started) abort the script.
-  systemctl status "${SERVICE_NAME}" --no-pager || true
+  # Full status to the log; a one-word state to the screen.
+  systemctl status "${SERVICE_NAME}" --no-pager >> "${LOG_FILE}" 2>&1 || true
+  SERVICE_STATE="$(systemctl is-active "${SERVICE_NAME}" 2>/dev/null || true)"
+  SERVICE_STATE="${SERVICE_STATE:-unknown}"
+
+  kv "Service" "${SERVICE_NAME}"
+  case "${SERVICE_STATE}" in
+    active)   ok "Service is active (running)." ;;
+    inactive) note "Service is installed but not running yet (finish setup to start it)." ;;
+    failed)   warn "Service reports 'failed' — check the log." ;;
+    *)        note "Service state: ${SERVICE_STATE}." ;;
+  esac
 fi
 
-echo "=========================================================="
-echo " TWG Security — bootstrap complete."
-echo " Full install log saved to: ${LOG_FILE}"
-echo "=========================================================="
+# ===========================================================================
+# 14. Closing summary
+# ===========================================================================
+# Best-effort local IP for the access hints (falls back to a placeholder).
+SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+SERVER_IP="${SERVER_IP:-<server-ip>}"
+
+section "Done"
+$NX_DONE     && kv "NX server"  "http://${SERVER_IP}:7001  (NX ${NX_EDITION^} ${NX_VERSION})"
+$WEBMIN_DONE && kv "Webmin"     "https://${SERVER_IP}:10000"
+kv "Log file" "${LOG_FILE}"
+
+$REBOOT_RECOMMENDED && warn "A reboot is recommended so the GPU kernel module loads."
+if $NX_DONE && [[ "${SERVICE_STATE}" != "active" ]]; then
+  note "Next: finish NX setup via the Nx client 'New Site' tile or http://${SERVER_IP}:7001"
+fi
+
+if $UI; then
+  printf '\n  %s%s Bootstrap complete %s\n\n' "$C_REDBG$C_WHITE$C_BOLD" '' "$C_RESET"
+else
+  printf '\nBootstrap complete.\n\n'
+fi
+logline "Bootstrap complete."
