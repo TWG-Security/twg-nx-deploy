@@ -5,12 +5,16 @@ mediaserver (**NX Witness** or **NX Meta**). It can also detect the GPU and
 install drivers, install Webmin, set the timezone/NTP, and it saves a full log
 of everything it did.
 
-The installer shows a clean, branded **status interface** on screen — a
-banner, a plan card, and one line per step with a spinner while it runs and a
-✔ / ✖ when it finishes — instead of a wall of raw output. The noisy
-apt/dpkg/curl output is tucked into the log file (see [section 4](#4-the-install-log)).
-On a plain pipe, in CI/cron, on a non-UTF-8 terminal, or with `NO_COLOR` set,
-it automatically falls back to plain text.
+On a capable terminal the installer **takes over the screen** with a
+full-screen dashboard — a fixed TWG banner, the run plan, and a live checklist
+of phases that tick from pending → running (spinner + timer) → ✔ / ✖ in place,
+like a proper installer app instead of a wall of scrolling logs. When it
+finishes, your screen is restored and a clean summary is printed. The noisy
+apt/dpkg/curl output goes to the log file (see [section 4](#4-the-install-log)).
+
+It degrades gracefully: a smaller or older terminal gets tidy line-by-line
+status; a plain pipe / CI / cron (no terminal) or `NO_COLOR` gets plain text.
+Set `NO_TUI=1` to force line-by-line mode on a full terminal.
 
 > **TWG Security — The Wire Guys.** This repo is **public**. Never commit
 > secrets, license keys, or internal hostnames here.
@@ -203,6 +207,7 @@ failure before reboot is normal.
 | `LOG_FILE`            | `/var/log/twg-nx-deploy-<date>.log` | Where to save the install log           |
 | `NX_PKG_URL`          | *(auto)*           | Override the download URL (wins over `NX_EDITION`)       |
 | `NO_COLOR`            | *(unset)*          | Set to any value to force plain, uncolored output        |
+| `NO_TUI`              | *(unset)*          | Set to any value to disable the full-screen dashboard (line-by-line) |
 
 ---
 
