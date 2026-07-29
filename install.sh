@@ -255,11 +255,20 @@ INSTALLER_VERSION="2.1"
 NX_VERSION="6.1.2"
 NX_BUILD="42921"
 
+# Proper product names for display — never show a bare lowercase "witness".
+edition_label() {
+  case "$1" in
+    meta) printf 'NX Meta' ;;
+    *)    printf 'NX Witness' ;;
+  esac
+}
+
 # Run-state flags, filled in as we go, used to build the closing summary.
 NX_DONE=false
 WEBMIN_DONE=false
 NVIDIA_INSTALLED=false
 SECUREBOOT="unknown"
+REBOOT_NEEDED=false
 
 # ---------------------------------------------------------------------------
 # 1a. Force every apt/dpkg step to be truly non-interactive
@@ -385,7 +394,7 @@ if [[ -n "${MENU_TTY}" ]]; then
     meta) ed_def="2" ;;
     *)    ed_def="1" ;;
   esac
-  printf '    %sNX edition:%s  %s1%s) witness   %s2%s) meta\n' \
+  printf '    %sNX edition:%s  %s1%s) NX Witness   %s2%s) NX Meta\n' \
     "$C_WHITE" "$C_RESET" "$C_RED" "$C_RESET" "$C_RED" "$C_RESET" >&2
   edchoice="$(ask_val "Choose 1 or 2" "${ed_def}")"
   case "${edchoice,,}" in
@@ -448,7 +457,7 @@ esac
 # 7. Show the effective plan (post-menu) so it's clear what's about to run
 # ---------------------------------------------------------------------------
 section "Deployment plan"
-kv "Edition"    "NX ${NX_EDITION^}"
+kv "Edition"    "$(edition_label "${NX_EDITION}")"
 kv "Version"    "${NX_VERSION} build ${NX_BUILD}"
 kv "Install NX" "${INSTALL_NX}"
 kv "GPU drivers" "${INSTALL_GPU_DRIVERS}"
@@ -470,7 +479,7 @@ trap 'printf "%s" "${SHOW}"; rm -rf "${WORKDIR}"' EXIT
 # ===========================================================================
 if [[ "${INSTALL_NX}" == "true" ]]; then
   section "NX mediaserver"
-  note "Edition: NX ${NX_EDITION^} ${NX_VERSION} (build ${NX_BUILD})"
+  note "Edition: $(edition_label "${NX_EDITION}") ${NX_VERSION} (build ${NX_BUILD})"
 
   # --- 9a. Download the .deb -----------------------------------------------
   if ! step "Downloading ${PKG_FILE}" \
@@ -626,7 +635,7 @@ if [[ "${INSTALL_GPU_DRIVERS}" != "false" ]]; then
       if modinfo nvidia >/dev/null 2>&1; then
         NVIDIA_INSTALLED=true
         ok "NVIDIA driver installed (version $(modinfo -F version nvidia 2>/dev/null || echo '?'))."
-        note "'nvidia-smi' will NOT work until you reboot — the kernel loads the module at boot."
+        note "It just needs a reboot to load — nvidia-smi will work once the system comes back up."
       else
         warn "NVIDIA driver files not found after install ('modinfo nvidia' failed)."
         warn "The DKMS build likely failed — check 'dkms status' and the log."
@@ -753,26 +762,51 @@ SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 SERVER_IP="${SERVER_IP:-<server-ip>}"
 
 section "Done"
-$NX_DONE     && kv "NX server"  "http://${SERVER_IP}:7001  (NX ${NX_EDITION^} ${NX_VERSION})"
+$NX_DONE     && kv "NX server"  "http://${SERVER_IP}:7001  ($(edition_label "${NX_EDITION}") ${NX_VERSION})"
 $WEBMIN_DONE && kv "Webmin"     "https://${SERVER_IP}:10000"
 kv "Log file" "${LOG_FILE}"
 
 if $NVIDIA_INSTALLED; then
   if [[ "${SECUREBOOT}" == "enabled" ]]; then
-    warn "NVIDIA driver installed, but Secure Boot is ON: 'nvidia-smi' will fail"
-    warn "until you enroll the module key (MOK Manager at next boot) or disable"
-    warn "Secure Boot in BIOS/UEFI. A reboot is required either way."
+    # Secure Boot means a plain reboot won't be enough, so don't offer one —
+    # just explain the extra step, kindly.
+    note "The NVIDIA driver is installed. Because Secure Boot is on, it needs one"
+    note "extra step to load: enroll the driver's key at the 'MOK Manager' screen"
+    note "on the next boot, or turn off Secure Boot in BIOS/UEFI. After that,"
+    note "nvidia-smi will work."
   else
-    warn "NVIDIA driver installed — run 'sudo reboot', then 'nvidia-smi' will work."
+    note "The NVIDIA driver is installed and ready — it just needs a reboot to load."
+    REBOOT_NEEDED=true
   fi
 fi
 if $NX_DONE && [[ "${SERVICE_STATE}" != "active" ]]; then
-  note "Next: finish NX setup via the Nx client 'New Site' tile or http://${SERVER_IP}:7001"
+  note "When you're ready, finish NX setup from the Nx client's 'New Site' tile,"
+  note "or open http://${SERVER_IP}:7001 in a browser."
 fi
 
 if $UI; then
-  printf '\n  %s%s Bootstrap complete %s\n\n' "$C_REDBG$C_WHITE$C_BOLD" '' "$C_RESET"
+  printf '\n  %s%s All done %s\n\n' "$C_REDBG$C_WHITE$C_BOLD" '' "$C_RESET"
 else
-  printf '\nBootstrap complete.\n\n'
+  printf '\nAll done.\n\n'
 fi
 logline "Bootstrap complete."
+
+# ---------------------------------------------------------------------------
+# 15. Offer to reboot (only when something we installed needs it)
+# ---------------------------------------------------------------------------
+# The GPU driver loads at boot, so a reboot is the last step. Rather than just
+# telling the tech to do it, offer to do it for them — but only when we're on a
+# real terminal that can answer. In automation we just leave a friendly note.
+if $REBOOT_NEEDED; then
+  if [[ -n "${MENU_TTY}" ]]; then
+    if [[ "$(ask_yn "This system needs a reboot to finish setting up the GPU driver. Reboot now?" "false")" == "true" ]]; then
+      note "Rebooting now — the server will be back in a moment."
+      logline "User approved reboot; rebooting."
+      reboot
+    else
+      note "No problem. Reboot whenever you're ready with:  sudo reboot"
+    fi
+  else
+    note "Reboot when you're ready to finish the GPU driver setup:  sudo reboot"
+  fi
+fi
