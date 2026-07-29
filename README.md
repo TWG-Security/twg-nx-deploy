@@ -5,6 +5,13 @@ mediaserver (**NX Witness** or **NX Meta**). It can also detect the GPU and
 install drivers, install Webmin, set the timezone/NTP, and it saves a full log
 of everything it did.
 
+The installer shows a clean, branded **status interface** on screen — a
+banner, a plan card, and one line per step with a spinner while it runs and a
+✔ / ✖ when it finishes — instead of a wall of raw output. The noisy
+apt/dpkg/curl output is tucked into the log file (see [section 4](#4-the-install-log)).
+On a plain pipe, in CI/cron, on a non-UTF-8 terminal, or with `NO_COLOR` set,
+it automatically falls back to plain text.
+
 > **TWG Security — The Wire Guys.** This repo is **public**. Never commit
 > secrets, license keys, or internal hostnames here.
 
@@ -88,20 +95,21 @@ curl -fsSL https://twg-security.github.io/twg-nx-deploy/install.sh | sudo \
 
 ## 3. The setup menu
 
-When you run the installer **from a terminal**, you'll see prompts like this
-before anything is installed:
+When you run the installer **from a terminal**, a short **Setup** section
+appears (styled with the TWG banner above it) with prompts like these before
+anything is installed:
 
 ```
-----------------------------------------------------------
- Interactive setup — press Enter to accept the [default].
-----------------------------------------------------------
-NX edition:  1) witness   2) meta
-Choose 1 or 2 [1]:
-Install the NX mediaserver? [Y/n]
-Detect GPU and install drivers? [Y/n]
-Install Webmin admin panel? [y/N]
-Timezone (blank = leave unchanged) [America/New_York]:
-Enable NTP time sync? [Y/n]
+  ▍ Setup
+    • Press Enter to accept the [default] shown for each option.
+
+    NX edition:  1) witness   2) meta
+    Choose 1 or 2 [1]:
+    Install the NX mediaserver? [Y/n]
+    Detect GPU and install drivers? [Y/n]
+    Install Webmin admin panel? [y/N]
+    Timezone (blank = leave unchanged) [America/New_York]:
+    Enable NTP time sync? [Y/n]
 ```
 
 - **Press Enter** to accept the default shown in `[brackets]`.
@@ -122,14 +130,16 @@ CI), so unattended runs never hang waiting for input.
 
 ## 4. The install log
 
-Every run writes a complete log — everything printed to the screen — to:
+The screen shows a tidy status view; the **complete, plain-text log** — every
+step plus all the raw apt/dpkg/curl output — is written to:
 
 ```
 /var/log/twg-nx-deploy-<date>-<time>.log
 ```
 
-The exact path is printed at the start and end of the run. If something goes
-wrong, grab that file to debug. To put it somewhere else:
+The exact path is shown at the start and in the closing summary. If a step
+fails, the installer also prints the last few log lines right on screen so you
+usually don't have to open the file. To put the log somewhere else:
 
 ```bash
 curl -fsSL https://twg-security.github.io/twg-nx-deploy/install.sh | sudo LOG_FILE=/root/nx-install.log bash
@@ -144,7 +154,7 @@ and installs the matching drivers:
 
 | GPU found | What it installs |
 |-----------|------------------|
-| **NVIDIA** | Recommended driver via `ubuntu-drivers` (Ubuntu). *A reboot is recommended afterward so the driver loads.* |
+| **NVIDIA** | Kernel headers + DKMS build tools, then the recommended driver via `ubuntu-drivers` (Ubuntu). It then verifies the module built. **You must reboot before `nvidia-smi` works.** |
 | **AMD**    | Mesa VAAPI drivers (`mesa-va-drivers`, `vainfo`) |
 | **Intel**  | Intel VAAPI drivers (`intel-media-va-driver`, `i965-va-driver`, `vainfo`) |
 | **None**   | Nothing — it just moves on |
@@ -154,6 +164,29 @@ Set `INSTALL_GPU_DRIVERS=false` to skip this step entirely.
 > **NVIDIA on Debian:** the driver lives in the `contrib`/`non-free` repos. The
 > installer attempts it and, if it can't, prints the exact commands to enable
 > those repos and install manually.
+
+### `nvidia-smi` fails right after install? — that's expected
+
+The driver files are installed, but the *running* kernel loads the `nvidia`
+module only at boot. Until you reboot, `nvidia-smi` reports **"couldn't
+communicate with the NVIDIA driver"** — the install worked, it's just not
+loaded yet.
+
+```bash
+sudo reboot        # then, once it's back:
+nvidia-smi
+```
+
+The installer confirms the driver built (`modinfo nvidia`) and says this in
+the closing summary, so a green ✔ on the driver step plus a `nvidia-smi`
+failure before reboot is normal.
+
+> **Secure Boot** is the one thing a reboot alone won't fix. When it's enabled,
+> the firmware refuses to load the freshly built (unsigned) NVIDIA module until
+> you either enroll its key at the **MOK Manager** screen on next boot or
+> disable Secure Boot in BIOS/UEFI. The installer detects Secure Boot and warns
+> you when this applies. If `nvidia-smi` still fails *after* a reboot, this is
+> almost always why — check with `mokutil --sb-state`.
 
 ---
 
@@ -170,6 +203,7 @@ Set `INSTALL_GPU_DRIVERS=false` to skip this step entirely.
 | `NONINTERACTIVE`      | `false`            | `true` = skip the menu                                   |
 | `LOG_FILE`            | `/var/log/twg-nx-deploy-<date>.log` | Where to save the install log           |
 | `NX_PKG_URL`          | *(auto)*           | Override the download URL (wins over `NX_EDITION`)       |
+| `NO_COLOR`            | *(unset)*          | Set to any value to force plain, uncolored output        |
 
 ---
 
