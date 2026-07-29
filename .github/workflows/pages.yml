@@ -1,0 +1,57 @@
+name: Deploy to GitHub Pages
+
+# Publishes the repo root (install.sh, checksums.txt, README, .nojekyll) to
+# GitHub Pages so the one-liner URL resolves:
+#   https://twg-security.github.io/twg-nx-deploy/install.sh
+#
+# One-time setup: Settings -> Pages -> Source = "GitHub Actions".
+# After that, every push to the default branch redeploys automatically.
+
+on:
+  # Redeploy whenever the served files change on the default branch.
+  push:
+    branches: [main]
+    paths:
+      - "install.sh"
+      - "checksums.txt"
+      - "README.md"
+      - ".nojekyll"
+      - ".github/workflows/pages.yml"
+  # Allow a manual redeploy from the Actions tab.
+  workflow_dispatch:
+
+# Least-privilege token scopes required by the deploy-pages action.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One live deployment at a time; a newer push supersedes an in-flight run
+# rather than piling up (don't cancel a running deploy midway).
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload repository root as the Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          # Serve the files verbatim from the repo root (.nojekyll disables
+          # Jekyll processing so install.sh is served as-is).
+          path: "."
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
