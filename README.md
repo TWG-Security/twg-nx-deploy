@@ -154,7 +154,7 @@ and installs the matching drivers:
 
 | GPU found | What it installs |
 |-----------|------------------|
-| **NVIDIA** | Recommended driver via `ubuntu-drivers` (Ubuntu). *A reboot is recommended afterward so the driver loads.* |
+| **NVIDIA** | Kernel headers + DKMS build tools, then the recommended driver via `ubuntu-drivers` (Ubuntu). It then verifies the module built. **You must reboot before `nvidia-smi` works.** |
 | **AMD**    | Mesa VAAPI drivers (`mesa-va-drivers`, `vainfo`) |
 | **Intel**  | Intel VAAPI drivers (`intel-media-va-driver`, `i965-va-driver`, `vainfo`) |
 | **None**   | Nothing — it just moves on |
@@ -164,6 +164,29 @@ Set `INSTALL_GPU_DRIVERS=false` to skip this step entirely.
 > **NVIDIA on Debian:** the driver lives in the `contrib`/`non-free` repos. The
 > installer attempts it and, if it can't, prints the exact commands to enable
 > those repos and install manually.
+
+### `nvidia-smi` fails right after install? — that's expected
+
+The driver files are installed, but the *running* kernel loads the `nvidia`
+module only at boot. Until you reboot, `nvidia-smi` reports **"couldn't
+communicate with the NVIDIA driver"** — the install worked, it's just not
+loaded yet.
+
+```bash
+sudo reboot        # then, once it's back:
+nvidia-smi
+```
+
+The installer confirms the driver built (`modinfo nvidia`) and says this in
+the closing summary, so a green ✔ on the driver step plus a `nvidia-smi`
+failure before reboot is normal.
+
+> **Secure Boot** is the one thing a reboot alone won't fix. When it's enabled,
+> the firmware refuses to load the freshly built (unsigned) NVIDIA module until
+> you either enroll its key at the **MOK Manager** screen on next boot or
+> disable Secure Boot in BIOS/UEFI. The installer detects Secure Boot and warns
+> you when this applies. If `nvidia-smi` still fails *after* a reboot, this is
+> almost always why — check with `mokutil --sb-state`.
 
 ---
 

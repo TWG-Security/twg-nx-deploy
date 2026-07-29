@@ -254,7 +254,8 @@ NX_BUILD="42921"
 # Run-state flags, filled in as we go, used to build the closing summary.
 NX_DONE=false
 WEBMIN_DONE=false
-REBOOT_RECOMMENDED=false
+NVIDIA_INSTALLED=false
+SECUREBOOT="unknown"
 
 # ---------------------------------------------------------------------------
 # 1a. Force every apt/dpkg step to be truly non-interactive
@@ -511,6 +512,32 @@ fi
 #   true  -> same as auto (kept as an explicit "yes")
 # GPU setup is an enhancement, not core provisioning, so failures here WARN
 # and continue rather than aborting the whole run.
+
+# detect_secureboot: echo "enabled" | "disabled" | "unknown".
+# Secure Boot is the firmware "bouncer" that only admits kernel modules signed
+# by a key it trusts. A freshly built NVIDIA module is unsigned, so on a
+# Secure-Boot box it won't load until its key is enrolled — worth knowing.
+# Prefer mokutil; fall back to reading the SecureBoot EFI variable directly
+# (its last byte is 1 = on, 0 = off). No EFI var => legacy BIOS / not present.
+detect_secureboot() {
+  if command -v mokutil >/dev/null 2>&1; then
+    case "$(mokutil --sb-state 2>/dev/null)" in
+      *[Ee]nabled*)  echo enabled;  return ;;
+      *[Dd]isabled*) echo disabled; return ;;
+    esac
+  fi
+  local var="/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+  if [[ -r "${var}" ]]; then
+    local last
+    last="$(od -An -t u1 "${var}" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' | tail -n1)"
+    case "${last}" in
+      1) echo enabled;  return ;;
+      0) echo disabled; return ;;
+    esac
+  fi
+  echo unknown
+}
+
 section "GPU drivers"
 if [[ "${INSTALL_GPU_DRIVERS}" != "false" ]]; then
 
@@ -548,17 +575,32 @@ if [[ "${INSTALL_GPU_DRIVERS}" != "false" ]]; then
     # --- NVIDIA ------------------------------------------------------------
     if [[ "${HAS_NVIDIA}" == "true" ]]; then
       note "NVIDIA GPU detected."
+
+      # DKMS builds the NVIDIA kernel module against THIS kernel, so it needs
+      # the matching headers plus a compiler. The driver metapackage usually
+      # pulls these in, but installing them explicitly makes the build reliable
+      # on minimal or HWE-kernel images where the deps don't line up — the most
+      # common reason the module silently fails to build.
+      step "Installing kernel headers + DKMS build tools" \
+        apt-get install -y "linux-headers-$(uname -r)" build-essential dkms \
+        || warn "Kernel headers / DKMS tools failed to install; the module build may fail."
+
+      # Warn about Secure Boot BEFORE the install so it's not a mystery later.
+      SECUREBOOT="$(detect_secureboot)"
+      if [[ "${SECUREBOOT}" == "enabled" ]]; then
+        warn "Secure Boot is ENABLED. The NVIDIA module is unsigned, so the kernel"
+        warn "will refuse to load it until you enroll its key (the 'MOK Manager'"
+        warn "screen at next boot) or disable Secure Boot in BIOS/UEFI. Until then"
+        warn "'nvidia-smi' will keep failing even after a reboot."
+      fi
+
       if [[ "${IS_UBUNTU}" == "true" ]]; then
         # ubuntu-drivers picks the recommended (latest stable) driver for the
         # exact card — the vendor-blessed path on Ubuntu.
         if step "Installing ubuntu-drivers-common" apt-get install -y ubuntu-drivers-common; then
-          if step "Installing recommended NVIDIA driver" ubuntu-drivers install; then
-            REBOOT_RECOMMENDED=true
-          elif step "Retry: ubuntu-drivers autoinstall" ubuntu-drivers autoinstall; then
-            REBOOT_RECOMMENDED=true
-          else
-            warn "NVIDIA driver install failed — install manually."
-          fi
+          step "Installing recommended NVIDIA driver" ubuntu-drivers install \
+            || step "Retry: ubuntu-drivers autoinstall" ubuntu-drivers autoinstall \
+            || warn "NVIDIA driver install failed — install manually."
         else
           warn "Could not install ubuntu-drivers-common — skipping NVIDIA."
         fi
@@ -566,13 +608,24 @@ if [[ "${INSTALL_GPU_DRIVERS}" != "false" ]]; then
         # Debian: the NVIDIA driver lives in contrib/non-free, which may not be
         # enabled. Attempt it, and if it fails point the tech at the manual fix
         # rather than silently mangling their apt sources.
-        if step "Installing nvidia-driver (Debian contrib/non-free)" apt-get install -y nvidia-driver; then
-          REBOOT_RECOMMENDED=true
-        else
-          warn "nvidia-driver unavailable. Enable 'contrib non-free"
-          warn "non-free-firmware' in /etc/apt/sources.list, run 'apt-get"
-          warn "update', then 'apt-get install nvidia-driver'."
-        fi
+        step "Installing nvidia-driver (Debian contrib/non-free)" apt-get install -y nvidia-driver \
+          || { warn "nvidia-driver unavailable. Enable 'contrib non-free"
+               warn "non-free-firmware' in /etc/apt/sources.list, run 'apt-get"
+               warn "update', then 'apt-get install nvidia-driver'."; }
+      fi
+
+      # Verify the driver files actually landed. DKMS installs the built module
+      # into the running kernel's tree, so 'modinfo nvidia' succeeds right after
+      # install even though the module can't LOAD until a reboot. This cleanly
+      # separates "install failed" from "installed, just needs a reboot" — the
+      # exact confusion behind an "nvidia-smi couldn't communicate" report.
+      if modinfo nvidia >/dev/null 2>&1; then
+        NVIDIA_INSTALLED=true
+        ok "NVIDIA driver installed (version $(modinfo -F version nvidia 2>/dev/null || echo '?'))."
+        note "'nvidia-smi' will NOT work until you reboot — the kernel loads the module at boot."
+      else
+        warn "NVIDIA driver files not found after install ('modinfo nvidia' failed)."
+        warn "The DKMS build likely failed — check 'dkms status' and the log."
       fi
     fi
 
@@ -700,7 +753,15 @@ $NX_DONE     && kv "NX server"  "http://${SERVER_IP}:7001  (NX ${NX_EDITION^} ${
 $WEBMIN_DONE && kv "Webmin"     "https://${SERVER_IP}:10000"
 kv "Log file" "${LOG_FILE}"
 
-$REBOOT_RECOMMENDED && warn "A reboot is recommended so the GPU kernel module loads."
+if $NVIDIA_INSTALLED; then
+  if [[ "${SECUREBOOT}" == "enabled" ]]; then
+    warn "NVIDIA driver installed, but Secure Boot is ON: 'nvidia-smi' will fail"
+    warn "until you enroll the module key (MOK Manager at next boot) or disable"
+    warn "Secure Boot in BIOS/UEFI. A reboot is required either way."
+  else
+    warn "NVIDIA driver installed — run 'sudo reboot', then 'nvidia-smi' will work."
+  fi
+fi
 if $NX_DONE && [[ "${SERVICE_STATE}" != "active" ]]; then
   note "Next: finish NX setup via the Nx client 'New Site' tile or http://${SERVER_IP}:7001"
 fi
