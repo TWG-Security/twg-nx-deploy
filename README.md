@@ -105,7 +105,6 @@ anything is installed:
 
     NX edition:  1) witness   2) meta
     Choose 1 or 2 [1]:
-    Install the NX mediaserver? [Y/n]
     Detect GPU and install drivers? [Y/n]
     Install Webmin admin panel? [y/N]
     Timezone (blank = leave unchanged) [America/New_York]:

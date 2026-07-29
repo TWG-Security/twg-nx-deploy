@@ -246,6 +246,10 @@ SET_TIMEZONE="${SET_TIMEZONE:-America/New_York}"    # empty string skips tz chan
 ENABLE_NTP="${ENABLE_NTP:-true}"             # enable network time sync?
 NONINTERACTIVE="${NONINTERACTIVE:-false}"    # force-skip the interactive menu?
 
+# Installer version — surfaced on screen so it's obvious at a glance which
+# build of THIS script is running (helps tell a fresh deploy from a cached one).
+INSTALLER_VERSION="2.1"
+
 # Pinned NX release. Bump these when TWG pins a new build.
 # See README.md -> "Updating the pinned version".
 NX_VERSION="6.1.2"
@@ -314,7 +318,7 @@ trap 'printf "%s" "${SHOW}"' EXIT
 # 3. Show the banner and record system context
 # ---------------------------------------------------------------------------
 banner
-note "Logging to ${LOG_FILE}"
+note "Installer v${INSTALLER_VERSION} · logging to ${LOG_FILE}"
 
 section "System"
 . /etc/os-release 2>/dev/null || true
@@ -390,8 +394,8 @@ if [[ -n "${MENU_TTY}" ]]; then
     *)         warn "Unrecognized '${edchoice}', keeping '${NX_EDITION}'." ;;
   esac
 
-  # Toggles.
-  INSTALL_NX="$(ask_yn "Install the NX mediaserver?" "${INSTALL_NX}")"
+  # Toggles. We deliberately do NOT ask "install the mediaserver?" — that's the
+  # whole reason someone runs this. Automation can still set INSTALL_NX=false.
   case "${INSTALL_GPU_DRIVERS}" in
     false) gpu_def="false" ;;
     *)     gpu_def="true"  ;;   # auto/true both present as "yes" in the menu
