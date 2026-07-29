@@ -173,6 +173,27 @@ Set `INSTALL_GPU_DRIVERS=false` to skip this step entirely.
 
 ---
 
+## 6a. Troubleshooting: install hangs on a magenta setup screen
+
+If a run stalls on a pink/magenta full-screen box titled **"Configuring
+networkoptix-mediaserver"** that says *"Installation is not yet complete… run
+Nx Witness Client and click New Site"* with an `<Ok>` button — and especially
+if you see stray `^[[A^[[B` characters when you press arrow keys — that's a
+`debconf`/`whiptail` dialog the package puts up during install. On a headless
+or remote/tunneled session it can block forever because keystrokes don't reach
+it cleanly.
+
+- **To get past it right now:** the `<Ok>` button is already selected — press
+  **Enter** (or **Tab** then **Enter**). The server is installed; it just isn't
+  set up yet. Finish setup from the Nx client's **New Site** tile or by opening
+  `http://<server-ip>:7001` in a browser.
+- **Permanent fix:** the installer now forces every apt/dpkg step to be truly
+  non-interactive (`DEBIAN_FRONTEND=noninteractive`, plus `needrestart` set to
+  auto-restart), so this dialog no longer appears. Re-pull the latest
+  `install.sh` and it won't happen again.
+
+---
+
 ## 7. Supported systems
 
 Debian and Ubuntu (anything with `apt-get`). The installer **must run as root**
