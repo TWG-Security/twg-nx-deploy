@@ -36,7 +36,7 @@ set -euo pipefail
 
 # Installer version — surfaced on screen so it's obvious at a glance which build
 # of THIS script is running (helps tell a fresh deploy from a cached one).
-INSTALLER_VERSION="2.2"
+INSTALLER_VERSION="2.3"
 
 # ===========================================================================
 # UI toolkit — capability detection, palette, banner, dashboard, phase engine
@@ -56,18 +56,36 @@ case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
   *) UTF8=false ;;
 esac
 
-# TWG Security brand palette (24-bit truecolor):
-#   primary red #C0392B · dark charcoal #1A1A1A · white #FFFFFF
-# Charcoal is near-black, so it's used only as a banner/badge background;
-# secondary text uses a dim grey that stays readable on any theme.
+# TWG Security brand palette: primary red #C0392B, white, dim grey.
+#
+# Color depth matters here. If we blindly emit 24-bit truecolor (#C0392B) to a
+# terminal that only does 256 colors, it gets approximated to the NEAREST cube
+# index — which for #C0392B is 166, an ORANGE (#d75f00). That's why the logo
+# looked orange. So we pick the red to match what the terminal actually
+# supports: truecolor gets exact #C0392B; 256-color gets index 160 (a clean
+# red); anything else gets basic ANSI red. We also NEVER wrap the red art in
+# bold — many terminals render bold as "brighter", which also skews red→orange.
 if $UI; then
   C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
-  C_RED=$'\033[38;2;192;57;43m'          # TWG red, foreground
-  C_REDBG=$'\033[48;2;192;57;43m'        # TWG red, background
-  C_WHITE=$'\033[38;2;255;255;255m'
-  C_GREY=$'\033[38;2;150;150;150m'
-  C_GREEN=$'\033[38;2;46;160;67m'
-  C_YELLOW=$'\033[38;2;214;153;33m'
+  if [[ "${COLORTERM:-}" == *truecolor* || "${COLORTERM:-}" == *24bit* ]]; then
+    C_RED=$'\033[38;2;192;57;43m'          # exact TWG red #C0392B
+    C_REDBG=$'\033[48;2;192;57;43m'
+    C_WHITE=$'\033[38;2;255;255;255m'
+    C_GREY=$'\033[38;2;150;150;150m'
+    C_GREEN=$'\033[38;2;46;160;67m'
+    C_YELLOW=$'\033[38;2;214;153;33m'
+  elif [[ "${TERM:-}" == *256color* ]]; then
+    C_RED=$'\033[38;5;160m'                # clean red, NOT the orange 166
+    C_REDBG=$'\033[48;5;160m'
+    C_WHITE=$'\033[38;5;231m'
+    C_GREY=$'\033[38;5;245m'
+    C_GREEN=$'\033[38;5;35m'
+    C_YELLOW=$'\033[38;5;178m'
+  else
+    C_RED=$'\033[31m'; C_REDBG=$'\033[41m'  # basic ANSI red
+    C_WHITE=$'\033[97m'; C_GREY=$'\033[90m'
+    C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+  fi
   CLR=$'\033[K'; HIDE=$'\033[?25l'; SHOW=$'\033[?25h'
   HOME_=$'\033[H'; CLRSCR=$'\033[2J'; CLREOS=$'\033[J'
   ALT_H=$'\033[?1049h'; ALT_L=$'\033[?1049l'
@@ -80,25 +98,24 @@ fi
 
 # Glyphs (UTF-8 vs ASCII fallback).
 if $UTF8; then
-  G_OK='✔'; G_BAD='✖'; G_WARN='⚠'; G_BAR='▍'; G_DOT='•'; G_PEND='·'; G_SKIP='–'; G_SUB='›'
+  G_OK='✔'; G_BAD='✖'; G_WARN='⚠'; G_BAR='▍'; G_DOT='•'; G_PEND='·'; G_SKIP='–'; G_SUB='›'; ELL='…'
   SPIN=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 else
-  G_OK='OK'; G_BAD='XX'; G_WARN='!!'; G_BAR='|'; G_DOT='-'; G_PEND='.'; G_SKIP='-'; G_SUB='>'
+  G_OK='OK'; G_BAD='XX'; G_WARN='!!'; G_BAR='|'; G_DOT='-'; G_PEND='.'; G_SKIP='-'; G_SUB='>'; ELL='..'
   SPIN=('|' '/' '-' '\')
 fi
 
 # --- Full-screen (TUI) capability ------------------------------------------
-# The dashboard needs color + UTF-8 + tput + a terminal at least 24x62. Anything
-# less falls back to line-by-line status. NO_TUI forces the fallback.
-TUI=false; ALT_ON=false; UIW=76
+# The dashboard needs color + UTF-8 + tput + a terminal at least 15x50 (it
+# shrinks the banner on short windows). Anything less falls back to
+# line-by-line status. NO_TUI forces the fallback.
+TUI=false; ALT_ON=false
 if $UI && $UTF8 && [[ -z "${NO_TUI:-}" ]] && command -v tput >/dev/null 2>&1; then
   _rows="$(tput lines 2>/dev/null || echo 0)"; _cols="$(tput cols 2>/dev/null || echo 0)"
-  if [[ "${_rows}" =~ ^[0-9]+$ && "${_cols}" =~ ^[0-9]+$ ]] && (( _rows >= 24 && _cols >= 62 )); then
+  if [[ "${_rows}" =~ ^[0-9]+$ && "${_cols}" =~ ^[0-9]+$ ]] && (( _rows >= 15 && _cols >= 50 )); then
     TUI=true
-    UIW=$(( _cols < 82 ? _cols - 4 : 78 ))
   fi
 fi
-DIV=""; for ((k = 0; k < UIW; k++)); do DIV+="─"; done
 
 # LOG_FILE is finalized in the logging section; declare early so helpers are
 # safe to call before it exists (they no-op until it's set).
@@ -140,60 +157,98 @@ dump_tail() {
   tail -n 8 "${LOG_FILE}" 2>/dev/null | sed "s/^/    ${C_DIM}/;s/\$/${C_RESET}/" || true
 }
 
-# draw_banner: the TWG block-art header (UTF-8), a compact badge (color only),
-# or a plain rule. Each line self-clears so it's safe inside the redraw loop.
-draw_banner() {
-  if $UI && $UTF8; then
-    printf '  %s%s████████╗██╗    ██╗ ██████╗ %s%s\n'  "$C_BOLD" "$C_RED" "$C_RESET" "$CLR"
-    printf '  %s%s╚══██╔══╝██║    ██║██╔════╝ %s   %s%sTWG SECURITY%s%s\n' "$C_BOLD" "$C_RED" "$C_RESET" "$C_BOLD" "$C_WHITE" "$C_RESET" "$CLR"
-    printf '  %s%s   ██║   ██║ █╗ ██║██║  ███╗%s   %s%sThe Wire Guys%s%s\n' "$C_BOLD" "$C_RED" "$C_RESET" "$C_DIM" "$C_GREY" "$C_RESET" "$CLR"
-    printf '  %s%s   ██║   ██║███╗██║██║   ██║%s%s\n'  "$C_BOLD" "$C_RED" "$C_RESET" "$CLR"
-    printf '  %s%s   ██║   ╚███╔███╔╝╚██████╔╝%s   %sNX Mediaserver Deployment · v%s%s%s\n' "$C_BOLD" "$C_RED" "$C_RESET" "$C_GREY" "$INSTALLER_VERSION" "$C_RESET" "$CLR"
-    printf '  %s%s   ╚═╝    ╚══╝╚══╝  ╚═════╝ %s%s\n'  "$C_BOLD" "$C_RED" "$C_RESET" "$CLR"
-  elif $UI; then
-    printf '  %s TWG SECURITY %s  %sNX Mediaserver Deployment · v%s%s%s\n' "$C_REDBG$C_WHITE$C_BOLD" "$C_RESET" "$C_GREY" "$INSTALLER_VERSION" "$C_RESET" "$CLR"
-    printf '  %sThe Wire Guys%s%s\n' "$C_DIM" "$C_RESET" "$CLR"
+# _trunc: clamp a plain (no-color) string to N columns with an ellipsis, so a
+# long path/detail can never wrap and shove the layout off the screen.
+_trunc() {
+  local s="$1" max="$2"
+  if (( ${#s} > max )); then printf '%s%s' "${s:0:max-1}" "$ELL"; else printf '%s' "$s"; fi
+}
+
+# _append_banner ARRAYNAME COMPACT: push the header lines onto the named array.
+# COMPACT=true (short windows) uses a one-line badge; otherwise the block art.
+# The red art is NEVER bold — bold skews the red toward orange on many terminals.
+_append_banner() {
+  local -n _a="$1"; local compact="$2"
+  if [[ "$compact" == "true" ]] || ! $UTF8; then
+    if $UI; then _a+=("  ${C_REDBG}${C_WHITE}${C_BOLD} TWG SECURITY ${C_RESET}  ${C_GREY}NX Mediaserver Deployment · v${INSTALLER_VERSION}${C_RESET}")
+    else _a+=(" TWG Security - NX Mediaserver Deployment v${INSTALLER_VERSION} (The Wire Guys)"); fi
   else
-    printf '==========================================================\n'
-    printf ' TWG Security - NX Mediaserver Deployment v%s (The Wire Guys)\n' "$INSTALLER_VERSION"
-    printf '==========================================================\n'
+    _a+=("  ${C_RED}████████╗██╗    ██╗ ██████╗ ${C_RESET}")
+    _a+=("  ${C_RED}╚══██╔══╝██║    ██║██╔════╝ ${C_RESET}   ${C_BOLD}${C_WHITE}TWG SECURITY${C_RESET}")
+    _a+=("  ${C_RED}   ██║   ██║ █╗ ██║██║  ███╗${C_RESET}   ${C_GREY}The Wire Guys${C_RESET}")
+    _a+=("  ${C_RED}   ██║   ██║███╗██║██║   ██║${C_RESET}")
+    _a+=("  ${C_RED}   ██║   ╚███╔███╔╝╚██████╔╝${C_RESET}   ${C_GREY}NX Mediaserver Deployment · v${INSTALLER_VERSION}${C_RESET}")
+    _a+=("  ${C_RED}   ╚═╝    ╚══╝╚══╝  ╚═════╝ ${C_RESET}")
   fi
 }
 
-# banner: the header as used on the normal screen (with breathing room).
-banner() { printf '\n'; draw_banner; printf '\n'; }
+# banner: the header on the normal screen (with breathing room).
+banner() {
+  local -a B=(); _append_banner B false
+  printf '\n'; local ln; for ln in "${B[@]}"; do printf '%s\n' "$ln"; done; printf '\n'
+}
 
-# render: repaint the whole dashboard in place. No-op unless TUI is active.
+# render: repaint the dashboard so it FILLS the terminal — banner and plan at
+# the top, the phase checklist below, blank fill, and the log footer pinned to
+# the bottom row. It measures the terminal every frame (so it adapts to the
+# window and to resizes) and builds exactly $rows lines, so it can never scroll
+# or get cut off at the bottom. No-op unless TUI is active.
 render() {
   $TUI || return 0
-  printf '%s\n' "$HOME_"                       # cursor home; row 1 stays blank
-  draw_banner
-  printf '  %s%s%s%s\n' "$C_DIM" "$DIV" "$C_RESET" "$CLR"
-  printf '  %sPlan%s  %s%s\n' "$C_GREY" "$C_RESET" "$PLAN_SUMMARY" "$CLR"
-  printf '  %s%s%s%s\n' "$C_DIM" "$DIV" "$C_RESET" "$CLR"
-  printf '%s\n' "$CLR"
-  local i st icon nc
+  local rows cols w
+  rows="$(tput lines 2>/dev/null || echo 24)"; cols="$(tput cols 2>/dev/null || echo 80)"
+  [[ "$rows" =~ ^[0-9]+$ ]] || rows=24; [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
+  w=$(( cols < 82 ? cols - 4 : 78 )); (( w < 20 )) && w=20
+  local div="" m; for ((m = 0; m < w; m++)); do div+="─"; done
+
+  local compact=false; (( rows < 22 )) && compact=true
+  local -a L=()
+  [[ "$compact" == "true" ]] || L+=("")            # top margin only when tall
+  _append_banner L "$compact"
+  L+=("  ${C_DIM}${div}${C_RESET}")
+  L+=("  ${C_GREY}Plan${C_RESET}  $(_trunc "${PLAN_SUMMARY}" $((w - 6)))")
+  L+=("  ${C_DIM}${div}${C_RESET}")
+  L+=("")
+
+  local i st icon nc name
   for i in "${!PHASE_NAMES[@]}"; do
-    st="${PHASE_STATUS[$i]}"
+    st="${PHASE_STATUS[$i]}"; name="$(_trunc "${PHASE_NAMES[$i]}" $((w - 12)))"
     case "$st" in
-      ok)   icon="${C_GREEN}${G_OK}${C_RESET}";  nc="" ;;
-      warn) icon="${C_YELLOW}${G_WARN}${C_RESET}"; nc="" ;;
-      fail) icon="${C_RED}${G_BAD}${C_RESET}";   nc="" ;;
+      ok)   icon="${C_GREEN}${G_OK}${C_RESET}";     nc="" ;;
+      warn) icon="${C_YELLOW}${G_WARN}${C_RESET}";  nc="" ;;
+      fail) icon="${C_RED}${G_BAD}${C_RESET}";      nc="" ;;
       run)  icon="${C_RED}${SPIN[$SPIN_I]}${C_RESET}"; nc="$C_BOLD" ;;
-      skip) icon="${C_DIM}${G_SKIP}${C_RESET}";  nc="$C_DIM" ;;
-      *)    icon="${C_DIM}${G_PEND}${C_RESET}";  nc="$C_DIM" ;;
+      skip) icon="${C_DIM}${G_SKIP}${C_RESET}";     nc="$C_DIM" ;;
+      *)    icon="${C_DIM}${G_PEND}${C_RESET}";     nc="$C_DIM" ;;
     esac
     if [[ "$st" == run ]]; then
-      printf '   %s  %s%s%s  %s[%ds]%s%s\n' "$icon" "$nc" "${PHASE_NAMES[$i]}" "$C_RESET" "$C_DIM" "$((SECONDS - PHASE_T0))" "$C_RESET" "$CLR"
-      printf '        %s%s %s%s%s\n' "$C_DIM" "$G_SUB" "$DETAIL" "$C_RESET" "$CLR"
+      L+=("   ${icon}  ${nc}${name}${C_RESET}  ${C_DIM}[$((SECONDS - PHASE_T0))s]${C_RESET}")
+      L+=("        ${C_DIM}${G_SUB} $(_trunc "${DETAIL}" $((w - 6)))${C_RESET}")
     else
-      printf '   %s  %s%s%s%s\n' "$icon" "$nc" "${PHASE_NAMES[$i]}" "$C_RESET" "$CLR"
+      L+=("   ${icon}  ${nc}${name}${C_RESET}")
     fi
   done
-  printf '%s\n' "$CLR"
-  printf '  %s%s%s%s\n' "$C_DIM" "$DIV" "$C_RESET" "$CLR"
-  printf '  %slog%s  %s%s%s%s\n' "$C_GREY" "$C_RESET" "$C_DIM" "$LOG_FILE" "$C_RESET" "$CLR"
-  printf '%s' "$CLREOS"
+
+  # Fit the body to (rows - 2): pad with blanks to push the footer down, or trim
+  # if the window is too short. Then the two footer lines land on the last rows.
+  local avail=$(( rows - 2 )) body=${#L[@]}
+  if (( body < avail )); then local p; for ((p = 0; p < avail - body; p++)); do L+=(""); done
+  elif (( body > avail )); then L=( "${L[@]:0:avail}" ); fi
+  L+=("  ${C_DIM}${div}${C_RESET}")
+  L+=("  ${C_GREY}log${C_RESET}  ${C_DIM}$(_trunc "${LOG_FILE}" $((w - 6)))${C_RESET}")
+
+  # Emit exactly $rows lines: home, each line cleared to EOL, no trailing
+  # newline on the last line (a newline on the bottom row would scroll).
+  printf '%s' "$HOME_"
+  local n=${#L[@]} j
+  for ((j = 0; j < n; j++)); do
+    printf '%s%s' "${L[$j]}" "$CLR"
+    (( j < n - 1 )) && printf '\n'
+  done
+  # Always succeed: the final (( ... )) above yields 1 on the last line, and
+  # callers (enter_tui, phase_begin, …) end on render — a non-zero return would
+  # trip `set -e` and abort the whole run.
+  return 0
 }
 
 # enter_tui / exit_tui: swap to the alternate screen buffer and back. The alt
