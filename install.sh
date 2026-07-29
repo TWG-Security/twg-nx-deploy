@@ -51,6 +51,36 @@ NX_VERSION="6.1.2"
 NX_BUILD="42921"
 
 # ---------------------------------------------------------------------------
+# 1a. Force every apt/dpkg step to be truly non-interactive
+# ---------------------------------------------------------------------------
+# `apt-get -y` answers apt's OWN prompts, but it does NOT stop a package's
+# post-install script from popping a debconf/whiptail dialog (e.g. the NX
+# mediaserver "Complete the setup process" note). On a headless or remote
+# (tunneled) session that dialog blocks forever waiting for a keypress the
+# pty never delivers — the install appears to hang on a magenta screen.
+#
+# In plain English: `-y` tells the cashier "yes" to their questions, but a
+# package can still hand you a form to sign — this makes debconf skip the
+# form entirely instead of waiting at the counter.
+#
+# Setting DEBIAN_FRONTEND=noninteractive switches debconf to a frontend that
+# renders nothing and returns immediately (notes are logged, not displayed).
+# DEBCONF_NONINTERACTIVE_SEEN=true additionally treats already-seen questions
+# as answered so re-runs don't re-prompt. Exported so every apt/dpkg call in
+# this script (NX, GPU drivers, Webmin) inherits it.
+#
+# NOTE: this does NOT affect our own menu below — that reads from /dev/tty,
+# not debconf — so techs still get the interactive picker on a real terminal.
+export DEBIAN_FRONTEND=noninteractive
+export DEBCONF_NONINTERACTIVE_SEEN=true
+
+# needrestart (Ubuntu 22.04+) is the OTHER common headless blocker: after a
+# library upgrade it throws up its own full-screen "which services to restart"
+# dialog. Tell it to just restart services automatically and never prompt.
+export NEEDRESTART_MODE=a
+export NEEDRESTART_SUSPEND=1
+
+# ---------------------------------------------------------------------------
 # 2. Install logging — capture EVERYTHING to a file for later debugging
 # ---------------------------------------------------------------------------
 # Timestamped log under /var/log by default; override with LOG_FILE. We route
@@ -231,11 +261,23 @@ if [[ "${INSTALL_NX}" == "true" ]]; then
 
   # --- 7b. Install ---------------------------------------------------------
   # apt-get resolves the .deb's dependencies for us. The leading ./ tells apt
-  # this is a local file, not a repo package name.
+  # this is a local file, not a repo package name. The Dpkg::Options keep the
+  # install unattended even if a config-file conflict comes up: keep the
+  # existing conffile (confold) and fall back to the package default when
+  # there's no old version (confdef), instead of stopping to ask. Combined
+  # with DEBIAN_FRONTEND=noninteractive (set at the top) this guarantees the
+  # mediaserver postinst never blocks on that whiptail "Complete the setup"
+  # note that hangs headless/remote runs.
   echo ">>> Installing ${PKG_FILE}"
   apt-get update -y
-  apt-get install -y "${WORKDIR}/${PKG_FILE}"
+  apt-get install -y \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confold" \
+    "${WORKDIR}/${PKG_FILE}"
   echo "    NX mediaserver installed."
+  echo "    NOTE: the server is installed but NOT yet set up. Finish setup in"
+  echo "          the Nx client via the 'New Site' tile, or open the server's"
+  echo "          web page at http://<server-ip>:7001 in a browser."
 
 else
   echo ">>> Skipping NX install (INSTALL_NX=${INSTALL_NX})."
