@@ -2,8 +2,8 @@
 
 One command sets up a fresh **Ubuntu/Debian** server with the Network Optix NX
 mediaserver (**NX Witness** or **NX Meta**). It can also detect the GPU and
-install drivers, install Webmin, set the timezone/NTP, and it saves a full log
-of everything it did.
+install drivers, install Webmin, install **CVEDIA-RT**, set the timezone/NTP,
+and it saves a full log of everything it did.
 
 On a capable terminal the installer **takes over the screen** with a
 full-screen dashboard — a fixed TWG banner, the run plan, and a live checklist
@@ -111,6 +111,7 @@ anything is installed:
     Choose 1 or 2 [1]:
     Detect GPU and install drivers? [Y/n]
     Install Webmin admin panel? [y/N]
+    Install CVEDIA-RT? (runs its own setup you'll step through) [y/N]
     Timezone (blank = leave unchanged) [America/New_York]:
     Enable NTP time sync? [Y/n]
 ```
@@ -193,6 +194,33 @@ failure before reboot is normal.
 
 ---
 
+## 5a. CVEDIA-RT (optional)
+
+Answer **yes** to the CVEDIA-RT prompt (or pass `INSTALL_CVEDIA=true`) and the
+installer will set up [CVEDIA-RT](https://get.cvedia.com), running the vendor's
+own commands:
+
+```bash
+curl -fsSLo - http://get.cvedia.com | sudo bash   # vendor bootstrap (interactive)
+sudo apt install cvedia-rt -y                      # the package
+```
+
+**CVEDIA's bootstrap has its own menu you must step through.** Because that's
+interactive, it can't run inside the full-screen dashboard (the prompts would
+be hidden). So the installer runs everything else first, **restores your
+screen, and then runs CVEDIA's setup on the visible terminal** so you can
+answer its menu — exactly like the vendor's one-liner. After you finish, it
+installs the `cvedia-rt` package and reports the result in the summary.
+
+```bash
+curl -fsSL https://twg-security.github.io/twg-nx-deploy/install.sh | sudo INSTALL_CVEDIA=true bash
+```
+
+> In a fully unattended run (no terminal), the bootstrap can't be stepped
+> through; the installer runs it non-interactively and warns if it needs input.
+
+---
+
 ## 6. All options
 
 | Variable              | Default            | What it does                                             |
@@ -201,6 +229,7 @@ failure before reboot is normal.
 | `INSTALL_NX`          | `true`             | Install the mediaserver                                  |
 | `INSTALL_GPU_DRIVERS` | `auto`             | `auto`/`true` = detect & install, `false` = skip         |
 | `INSTALL_WEBMIN`      | `false`            | Install the Webmin admin panel                           |
+| `INSTALL_CVEDIA`      | `false`            | Install CVEDIA-RT (runs the vendor's interactive setup)  |
 | `SET_TIMEZONE`        | `America/New_York` | Timezone to set (**blank = leave unchanged**)            |
 | `ENABLE_NTP`          | `true`             | Turn on network time sync                                |
 | `NONINTERACTIVE`      | `false`            | `true` = skip the menu                                   |
