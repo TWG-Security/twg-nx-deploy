@@ -36,7 +36,7 @@ set -euo pipefail
 
 # Installer version — surfaced on screen so it's obvious at a glance which build
 # of THIS script is running (helps tell a fresh deploy from a cached one).
-INSTALLER_VERSION="2.5"
+INSTALLER_VERSION="2.6"
 
 # ===========================================================================
 # UI toolkit — capability detection, palette, banner, dashboard, phase engine
@@ -415,6 +415,7 @@ fi
 NX_EDITION="${NX_EDITION:-witness}"          # witness | meta
 INSTALL_NX="${INSTALL_NX:-true}"             # install the mediaserver at all?
 INSTALL_WEBMIN="${INSTALL_WEBMIN:-false}"    # install the Webmin admin panel?
+INSTALL_CVEDIA="${INSTALL_CVEDIA:-false}"    # install CVEDIA-RT (has its own setup)
 INSTALL_GPU_DRIVERS="${INSTALL_GPU_DRIVERS:-auto}"  # auto | true | false
 SET_TIMEZONE="${SET_TIMEZONE:-America/New_York}"    # empty string skips tz change
 ENABLE_NTP="${ENABLE_NTP:-true}"             # enable network time sync?
@@ -433,6 +434,7 @@ edition_label() {
 # Run-state flags / values, filled in as we go and used to build the summary.
 NX_DONE=false
 WEBMIN_DONE=false
+CVEDIA_DONE=false
 NVIDIA_INSTALLED=false
 SECUREBOOT="unknown"
 REBOOT_NEEDED=false
@@ -560,6 +562,7 @@ if [[ -n "${MENU_TTY}" ]]; then
     INSTALL_GPU_DRIVERS="false"
   fi
   INSTALL_WEBMIN="$(ask_yn "Install Webmin admin panel?" "${INSTALL_WEBMIN}")"
+  INSTALL_CVEDIA="$(ask_yn "Install CVEDIA-RT? (runs its own setup you'll step through)" "${INSTALL_CVEDIA}")"
   SET_TIMEZONE="$(ask_val "Timezone (blank = leave unchanged)" "${SET_TIMEZONE}")"
   ENABLE_NTP="$(ask_yn "Enable NTP time sync?" "${ENABLE_NTP}")"
 else
@@ -596,12 +599,13 @@ kv "Version"     "${NX_VERSION} build ${NX_BUILD}"
 kv "Install NX"  "${INSTALL_NX}"
 kv "GPU drivers" "${INSTALL_GPU_DRIVERS}"
 kv "Webmin"      "${INSTALL_WEBMIN}"
+kv "CVEDIA-RT"   "${INSTALL_CVEDIA}$( [[ "${INSTALL_CVEDIA}" == "true" ]] && echo "  (interactive setup, after the dashboard)" )"
 kv "Timezone"    "${SET_TIMEZONE:-<unchanged>}"
 kv "NTP"         "${ENABLE_NTP}"
 kv "Package"     "${PKG_FILE}"
 
 # One-line plan for the dashboard header.
-PLAN_SUMMARY="$(edition_label "${NX_EDITION}") ${NX_VERSION} · GPU ${INSTALL_GPU_DRIVERS} · Webmin ${INSTALL_WEBMIN} · TZ ${SET_TIMEZONE:-unchanged}"
+PLAN_SUMMARY="$(edition_label "${NX_EDITION}") ${NX_VERSION} · GPU ${INSTALL_GPU_DRIVERS} · Webmin ${INSTALL_WEBMIN} · CVEDIA ${INSTALL_CVEDIA} · TZ ${SET_TIMEZONE:-unchanged}"
 
 # Build the phase checklist from the chosen options (order = run order).
 P_DL=-1; P_NX=-1; P_GPU=-1; P_WEB=-1; P_TIME=-1; P_SVC=-1
@@ -792,9 +796,48 @@ if [[ "${INSTALL_NX}" == "true" ]]; then
 fi
 
 # ===========================================================================
-# 10. Restore the screen and print the summary
+# 10. Restore the screen; run CVEDIA-RT interactively; print the summary
 # ===========================================================================
 exit_tui
+
+# --- CVEDIA-RT (optional, INTERACTIVE) -------------------------------------
+# CVEDIA-RT's own installer (get.cvedia.com) presents a menu the tech must step
+# through, so it can't run inside our non-interactive dashboard — its prompts
+# would be hidden and it would hang. We run it here on the restored, visible
+# terminal, connected to the keyboard, exactly like the vendor's documented
+# `curl … | sudo bash`. Then we install the package with apt (-y, quiet).
+if [[ "${INSTALL_CVEDIA}" == "true" ]]; then
+  section "CVEDIA-RT"
+  note "CVEDIA-RT has its own installer with prompts — follow them on screen."
+  note "(This part is interactive, so it runs here rather than in the dashboard.)"
+  printf '\n'
+  CVEDIA_BOOT="${WORKDIR}/cvedia-bootstrap.sh"
+  logline "CVEDIA: downloading bootstrap from http://get.cvedia.com"
+  if curl -fsSL http://get.cvedia.com -o "${CVEDIA_BOOT}"; then
+    # Run the vendor bootstrap with a clean, interactive environment (undo our
+    # forced-noninteractive apt/debconf/needrestart settings) and stdin wired to
+    # the terminal, so ITS menu behaves just like the vendor's own one-liner.
+    # We are already root, so no nested sudo is needed.
+    if [[ -n "${MENU_TTY}" ]]; then
+      env -u DEBIAN_FRONTEND -u DEBCONF_NONINTERACTIVE_SEEN -u NEEDRESTART_MODE -u NEEDRESTART_SUSPEND \
+        bash "${CVEDIA_BOOT}" < "${MENU_TTY}" \
+        || warn "CVEDIA bootstrap exited non-zero — see its output above."
+    else
+      note "No terminal available — running the CVEDIA bootstrap non-interactively."
+      bash "${CVEDIA_BOOT}" </dev/null || warn "CVEDIA bootstrap exited non-zero — see the output above."
+    fi
+    printf '\n'
+    # Install the package itself non-interactively; keep this output in the log.
+    printf '    %s%s installing the cvedia-rt package…%s\n' "$C_DIM" "$G_SUB" "$C_RESET"
+    if apt-get install -y cvedia-rt >> "${LOG_FILE}" 2>&1; then
+      CVEDIA_DONE=true; ok "CVEDIA-RT installed."
+    else
+      warn "cvedia-rt package failed to install — did the bootstrap add its apt repo? See the log."
+    fi
+  else
+    warn "Could not download the CVEDIA bootstrap from http://get.cvedia.com."
+  fi
+fi
 
 SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 SERVER_IP="${SERVER_IP:-<server-ip>}"
@@ -802,6 +845,7 @@ SERVER_IP="${SERVER_IP:-<server-ip>}"
 section "Summary"
 $NX_DONE     && kv "NX server"  "http://${SERVER_IP}:7001  ($(edition_label "${NX_EDITION}") ${NX_VERSION})"
 $WEBMIN_DONE && kv "Webmin"     "https://${SERVER_IP}:10000"
+$CVEDIA_DONE && kv "CVEDIA-RT"  "installed (cvedia-rt)"
 kv "Log file" "${LOG_FILE}"
 
 if (( ${#WARNINGS[@]} )); then
