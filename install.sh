@@ -36,7 +36,7 @@ set -euo pipefail
 
 # Installer version — surfaced on screen so it's obvious at a glance which build
 # of THIS script is running (helps tell a fresh deploy from a cached one).
-INSTALLER_VERSION="2.3"
+INSTALLER_VERSION="2.4"
 
 # ===========================================================================
 # UI toolkit — capability detection, palette, banner, dashboard, phase engine
@@ -106,15 +106,38 @@ else
 fi
 
 # --- Full-screen (TUI) capability ------------------------------------------
-# The dashboard needs color + UTF-8 + tput + a terminal at least 15x50 (it
-# shrinks the banner on short windows). Anything less falls back to
-# line-by-line status. NO_TUI forces the fallback.
-TUI=false; ALT_ON=false
-if $UI && $UTF8 && [[ -z "${NO_TUI:-}" ]] && command -v tput >/dev/null 2>&1; then
-  _rows="$(tput lines 2>/dev/null || echo 0)"; _cols="$(tput cols 2>/dev/null || echo 0)"
-  if [[ "${_rows}" =~ ^[0-9]+$ && "${_cols}" =~ ^[0-9]+$ ]] && (( _rows >= 15 && _cols >= 50 )); then
-    TUI=true
+# _termsize: echo "ROWS COLS" for the real terminal. The reliable source when
+# stdin is a pipe (curl | sudo bash) is the controlling terminal /dev/tty —
+# `tput` frequently reports 0 in that context, which is what was silently
+# disabling the dashboard. We try /dev/tty first, then tput, then env, then a
+# sane default.
+_termsize() {
+  local sz r c
+  if sz="$(stty size 2>/dev/null </dev/tty)" && [[ "$sz" =~ ^[0-9]+\ [0-9]+$ ]] && (( ${sz%% *} > 0 )); then
+    printf '%s' "$sz"; return 0
   fi
+  if command -v tput >/dev/null 2>&1; then
+    r="$(tput lines 2>/dev/null || true)"; c="$(tput cols 2>/dev/null || true)"
+    if [[ "$r" =~ ^[0-9]+$ && "$c" =~ ^[0-9]+$ ]] && (( r > 0 && c > 0 )); then printf '%s %s' "$r" "$c"; return 0; fi
+  fi
+  printf '%s %s' "${LINES:-24}" "${COLUMNS:-80}"
+}
+# _measure: cache the current size in TROWS/TCOLS (called at phase boundaries so
+# render() doesn't spawn a process every animation frame).
+TROWS=24; TCOLS=80
+_measure() { read -r TROWS TCOLS <<<"$(_termsize)"; }
+
+# The dashboard needs color + UTF-8 + a terminal at least 15x50 (it shrinks the
+# banner on short windows). Otherwise it falls back to line-by-line status and
+# records WHY, so the fallback is never a silent mystery. NO_TUI forces it.
+TUI=false; ALT_ON=false; TUI_OFF_REASON=""
+if ! $UI; then TUI_OFF_REASON="no color/not a terminal"
+elif ! $UTF8; then TUI_OFF_REASON="terminal locale is not UTF-8"
+elif [[ -n "${NO_TUI:-}" ]]; then TUI_OFF_REASON="NO_TUI is set"
+else
+  read -r _rows _cols <<<"$(_termsize)"
+  if (( _rows >= 15 && _cols >= 50 )); then TUI=true
+  else TUI_OFF_REASON="window ${_rows}x${_cols} is below 15x50"; fi
 fi
 
 # LOG_FILE is finalized in the logging section; declare early so helpers are
@@ -195,9 +218,7 @@ banner() {
 # or get cut off at the bottom. No-op unless TUI is active.
 render() {
   $TUI || return 0
-  local rows cols w
-  rows="$(tput lines 2>/dev/null || echo 24)"; cols="$(tput cols 2>/dev/null || echo 80)"
-  [[ "$rows" =~ ^[0-9]+$ ]] || rows=24; [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
+  local rows="${TROWS:-24}" cols="${TCOLS:-80}" w
   w=$(( cols < 82 ? cols - 4 : 78 )); (( w < 20 )) && w=20
   local div="" m; for ((m = 0; m < w; m++)); do div+="─"; done
 
@@ -254,7 +275,7 @@ render() {
 # enter_tui / exit_tui: swap to the alternate screen buffer and back. The alt
 # buffer is why the dashboard can "take over" and then vanish cleanly, leaving
 # the user's scrollback untouched (same trick less/vim/htop use).
-enter_tui() { $TUI || return 0; printf '%s%s%s%s' "$ALT_H" "$CLRSCR" "$HOME_" "$HIDE"; ALT_ON=true; render; }
+enter_tui() { $TUI || return 0; _measure; printf '%s%s%s%s' "$ALT_H" "$CLRSCR" "$HOME_" "$HIDE"; ALT_ON=true; render; }
 exit_tui()  { $ALT_ON || return 0; printf '%s%s' "$SHOW" "$ALT_L"; ALT_ON=false; }
 
 # --- Phase engine -----------------------------------------------------------
@@ -274,6 +295,7 @@ add_warn() {
 # phase_end can auto-decide ✔ vs ⚠.
 phase_begin() {
   CUR_PHASE=$1; PHASE_STATUS[$1]="run"; PHASE_T0=$SECONDS; WMARK=${#WARNINGS[@]}; DETAIL="starting…"
+  $TUI && _measure
   logline "PHASE begin: ${PHASE_NAMES[$1]}"
   if $TUI; then render
   elif $UI; then printf '\n  %s%s%s %s%s%s\n' "$C_RED" "$G_BAR" "$C_RESET" "$C_BOLD" "${PHASE_NAMES[$1]}" "$C_RESET"
@@ -449,6 +471,11 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 banner
 note "Installer v${INSTALLER_VERSION} · logging to ${LOG_FILE}"
+# If we're on a color terminal but the full-screen dashboard is off, say why —
+# so a line-by-line run is never a silent surprise.
+if $UI && ! $TUI && [[ -n "${TUI_OFF_REASON}" ]]; then
+  note "Full-screen dashboard off (${TUI_OFF_REASON}) — showing step-by-step."
+fi
 
 section "System"
 . /etc/os-release 2>/dev/null || true
