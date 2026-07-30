@@ -36,7 +36,7 @@ set -euo pipefail
 
 # Installer version — surfaced on screen so it's obvious at a glance which build
 # of THIS script is running (helps tell a fresh deploy from a cached one).
-INSTALLER_VERSION="2.4"
+INSTALLER_VERSION="2.5"
 
 # ===========================================================================
 # UI toolkit — capability detection, palette, banner, dashboard, phase engine
@@ -275,8 +275,21 @@ render() {
 # enter_tui / exit_tui: swap to the alternate screen buffer and back. The alt
 # buffer is why the dashboard can "take over" and then vanish cleanly, leaving
 # the user's scrollback untouched (same trick less/vim/htop use).
-enter_tui() { $TUI || return 0; _measure; printf '%s%s%s%s' "$ALT_H" "$CLRSCR" "$HOME_" "$HIDE"; ALT_ON=true; render; }
-exit_tui()  { $ALT_ON || return 0; printf '%s%s' "$SHOW" "$ALT_L"; ALT_ON=false; }
+# tui_open: enter the alternate screen at STARTUP so the whole run — banner,
+# menu, and dashboard — owns the terminal from the first moment. The cursor
+# stays visible here because the interactive menu needs it for typing.
+tui_open() { $TUI || return 0; printf '%s%s%s%s' "$ALT_H" "$CLRSCR" "$HOME_" "$SHOW"; ALT_ON=true; }
+
+# enter_tui: hand off from the intro/menu to the LIVE dashboard — clear the menu
+# text, hide the cursor, measure the window, and paint the first frame.
+enter_tui() {
+  $TUI || return 0
+  $ALT_ON || { printf '%s' "$ALT_H"; ALT_ON=true; }
+  _measure
+  printf '%s%s%s' "$CLRSCR" "$HOME_" "$HIDE"
+  render
+}
+exit_tui() { $ALT_ON || return 0; printf '%s%s' "$SHOW" "$ALT_L"; ALT_ON=false; }
 
 # --- Phase engine -----------------------------------------------------------
 # push_phase adds a checklist entry (records its index in LAST_PHASE).
@@ -469,6 +482,9 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 # 3. Banner + system context (normal screen, before the dashboard)
 # ---------------------------------------------------------------------------
+# Take over the terminal now (if capable) so the banner and the menu appear in
+# the full-screen buffer, not scrolling in the normal one.
+tui_open
 banner
 note "Installer v${INSTALLER_VERSION} · logging to ${LOG_FILE}"
 # If we're on a color terminal but the full-screen dashboard is off, say why —
