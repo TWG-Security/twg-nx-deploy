@@ -395,10 +395,10 @@ detect_secureboot() {
 }
 
 # detect_platform: identify the hardware so the plan shows WHAT we're installing
-# on, not just the CPU type. Sets PLATFORM_KIND (jetson | qualcomm | arm64-other
-# | x86-vm | x86 | other) and PLATFORM_DESC (human-readable). The NX arm64
-# server build is published for NVIDIA Jetson and Qualcomm boards specifically,
-# so knowing the board matters on ARM. Sources, cheapest first: the device tree
+# on, not just the CPU type. Sets PLATFORM_KIND (jetson | qualcomm | raspberrypi
+# | arm64-other | arm32-other | x86-vm | x86 | other) and PLATFORM_DESC
+# (human-readable). NX's ARM server builds target specific boards — arm64 for
+# NVIDIA Jetson / Qualcomm, arm32 for Raspberry Pi — so the board matters on ARM. Sources, cheapest first: the device tree
 # (ARM boards), the Jetson L4T release file, DMI (x86), systemd-detect-virt.
 PLATFORM_KIND="other"; PLATFORM_DESC="unknown"
 detect_platform() {
@@ -416,6 +416,12 @@ detect_platform() {
   elif [[ "${compat}" == *qcom,* ]]; then
     PLATFORM_KIND="qualcomm"
     PLATFORM_DESC="Qualcomm${model:+ — ${model}}"
+  elif [[ "${model}" == *"Raspberry Pi"* || "${compat}" == *raspberrypi* ]]; then
+    PLATFORM_KIND="raspberrypi"
+    PLATFORM_DESC="${model:-Raspberry Pi} · ${HOST_ARCH} OS"
+  elif [[ "${HOST_ARCH}" == "armhf" ]]; then
+    PLATFORM_KIND="arm32-other"
+    PLATFORM_DESC="ARM32 board${model:+ — ${model}}"
   elif [[ "${HOST_ARCH}" == "arm64" ]]; then
     PLATFORM_KIND="arm64-other"
     PLATFORM_DESC="ARM64 board${model:+ — ${model}}${virt:+ (virtual: ${virt})}"
@@ -507,7 +513,7 @@ SET_TIMEZONE="${SET_TIMEZONE:-America/New_York}"    # empty string skips tz chan
 ENABLE_NTP="${ENABLE_NTP:-true}"             # enable network time sync?
 NONINTERACTIVE="${NONINTERACTIVE:-false}"    # force-skip the interactive menu?
 CHECK_ONLY="${CHECK_ONLY:-false}"            # run preflight + dependency checks only
-NX_ARCH="${NX_ARCH:-}"                       # force package arch suffix (x64|arm64); blank = auto
+NX_ARCH="${NX_ARCH:-}"                       # force package arch suffix (x64|arm64|arm32); blank = auto
 MIN_FREE_MB_OPT=2048                         # /opt free space below this = fatal
 MIN_FREE_MB_TMP=512                          # temp free space below this = fatal
 
@@ -668,23 +674,26 @@ fi
 # ---------------------------------------------------------------------------
 # 6. Resolve the package URL from the edition (unless explicitly overridden)
 # ---------------------------------------------------------------------------
-# Network Optix publishes a separate .deb per CPU architecture, and each lives
-# in its own folder: x64 under /linux/, arm64 under /arm/, e.g.
-#   .../metavms/42921/arm/metavms-server-6.1.2.42921-linux_arm64.deb Picking the x64 build on an ARM box (e.g. an
-# NVIDIA Jetson) makes apt treat it as a foreign :amd64 package, and EVERY
+# Network Optix publishes a separate .deb per CPU architecture. x64 lives under
+# /linux/; both ARM builds live under /arm/:
+#   x64    .../linux/metavms-server-6.1.2.42921-linux_x64.deb
+#   arm64  .../arm/metavms-server-6.1.2.42921-linux_arm64.deb  (NVIDIA Jetson, Qualcomm)
+#   arm32  .../arm/metavms-server-6.1.2.42921-linux_arm32.deb  (Raspberry Pi)
+# Picking the x64 build on an ARM box (e.g. an NVIDIA Jetson) makes apt treat it as a foreign :amd64 package, and EVERY
 # dependency then reads "not installable" — so map the host arch explicitly.
 if [[ -z "${NX_ARCH}" ]]; then
   case "${HOST_ARCH}" in
     amd64) NX_ARCH="x64" ;;
     arm64) NX_ARCH="arm64" ;;
+    armhf) NX_ARCH="arm32" ;;
     *)     NX_ARCH="" ;;
   esac
 fi
 if [[ "${INSTALL_NX}" == "true" && -z "${NX_ARCH}" && -z "${NX_PKG_URL:-}" ]]; then
   die "Unsupported CPU architecture for the NX mediaserver: ${HOST_ARCH} ($(uname -m)).
-        NX server packages are published for x64 (amd64) and arm64 only."
+        NX server packages are published for x64 (amd64), arm64 and arm32 (armhf) only."
 fi
-case "${NX_ARCH}" in arm64) NX_DIR="arm" ;; *) NX_DIR="linux" ;; esac
+case "${NX_ARCH}" in arm64|arm32) NX_DIR="arm" ;; *) NX_DIR="linux" ;; esac
 WITNESS_URL="https://updates.networkoptix.com/default/${NX_BUILD}/${NX_DIR}/nxwitness-server-${NX_VERSION}.${NX_BUILD}-linux_${NX_ARCH}.deb"
 META_URL="https://updates.networkoptix.com/metavms/${NX_BUILD}/${NX_DIR}/metavms-server-${NX_VERSION}.${NX_BUILD}-linux_${NX_ARCH}.deb"
 
@@ -716,7 +725,12 @@ kv "CVEDIA-RT"   "${INSTALL_CVEDIA}$( [[ "${INSTALL_CVEDIA}" == "true" ]] && ech
 kv "Timezone"    "${SET_TIMEZONE:-<unchanged>}"
 kv "NTP"         "${ENABLE_NTP}"
 kv "Package"     "${PKG_FILE}"
-[[ "${NX_ARCH}" == "arm64" && -z "${NX_PKG_URL:-}" ]] && kv "Build" "ARM64 (NVIDIA Jetson, Qualcomm) server installer"
+if [[ -z "${NX_PKG_URL:-}" ]]; then
+  case "${NX_ARCH}" in
+    arm64) kv "Build" "ARM64 (NVIDIA Jetson, Qualcomm) server installer" ;;
+    arm32) kv "Build" "ARM32 (Raspberry Pi) server installer" ;;
+  esac
+fi
 [[ "${CHECK_ONLY}" == "true" ]] && kv "Mode" "CHECK ONLY — preflight + dependency checks, nothing installed"
 
 # One-line plan for the dashboard header.
@@ -755,14 +769,17 @@ enter_tui
 # route to the vendor) BEFORE touching anything, and say plainly what's wrong.
 phase_begin "$P_PRE"
 
-# Platform fit. The vendor's arm64 server build is "ARM64 (Nvidia Jetson,
-# Qualcomm)"; other ARM64 boards (Raspberry Pi, Ampere, cloud Graviton...) may
-# or may not run it, so flag it rather than block. Containers get a note: the
+# Platform fit. The vendor's ARM server builds are "ARM64 (Nvidia Jetson,
+# Qualcomm)" and "ARM32 (Raspberry Pi)". Other ARM boards (Ampere, Graviton,
+# a Pi on a 64-bit OS...) may or may not run them, so flag rather than block. Containers get a note: the
 # mediaserver expects systemd and real storage.
 phase_detail "Platform: ${PLATFORM_DESC}"
 if [[ "${INSTALL_NX}" == "true" && -z "${NX_PKG_URL:-}" ]]; then
   case "${PLATFORM_KIND}" in
     arm64-other) add_warn "This ARM64 board isn't an NVIDIA Jetson or Qualcomm device — the NX arm64 server build targets those. It may still work; test before deploying." ;;
+    arm32-other) add_warn "This ARM32 board isn't a Raspberry Pi — the NX arm32 server build targets the Pi. It may still work; test before deploying." ;;
+    raspberrypi)
+      [[ "${HOST_ARCH}" == "arm64" ]] && add_warn "Raspberry Pi with a 64-bit OS: the NX build for the Pi is ARM32, so this will use the arm64 (Jetson/Qualcomm) build. For the supported Pi build, install a 32-bit (armhf) OS." ;;
   esac
 fi
 case "$(systemd-detect-virt --container 2>/dev/null || true)" in

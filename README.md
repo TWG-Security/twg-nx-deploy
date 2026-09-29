@@ -171,8 +171,8 @@ install fail halfway is caught here, before the system is changed.
 
 | Check | What happens if it fails |
 |-------|--------------------------|
-| CPU architecture is supported (`amd64` → x64 build, `arm64` → arm64 build) | Stops: *unsupported architecture* |
-| Platform: NVIDIA Jetson (with L4T/JetPack version), Qualcomm, other ARM64 board, physical x86, VM or container. Shown as **Platform** at startup | ARM64 board that isn't Jetson/Qualcomm: warning (the vendor's arm64 build targets those). Container: warning. Neither blocks the install |
+| CPU architecture is supported (`amd64` → x64 build, `arm64` → arm64 build, `armhf` → arm32 build) | Stops: *unsupported architecture* |
+| Platform: NVIDIA Jetson (with L4T/JetPack version), Qualcomm, Raspberry Pi, other ARM board, physical x86, VM or container. Shown as **Platform** at startup | Warning for an ARM board the vendor's build doesn't target, a Raspberry Pi on a 64-bit OS, or a container. Warnings don't block the install |
 | apt/dpkg lock held (e.g. `unattended-upgrades` on first boot) | Waits up to 5 min, then stops |
 | dpkg left half-configured by an earlier interrupted install | Runs `dpkg --configure -a` automatically |
 | Broken package dependencies (`apt-get check`) | Runs `apt-get -f install`; stops if that fails |
@@ -192,14 +192,23 @@ install fail halfway is caught here, before the system is changed.
 download and dry run), prints a pass/fail result, and exits without installing
 anything. Use it to vet a server before a site visit.
 
-### ARM64 servers (NVIDIA Jetson, Qualcomm)
+### ARM servers (NVIDIA Jetson, Qualcomm, Raspberry Pi)
 
-The installer now picks the matching build automatically: `linux_x64.deb` on
-x86-64 servers, and the vendor's **"ARM64 (Nvidia Jetson, Qualcomm) - Server
-installer"** (`linux_arm64.deb`) on ARM64 servers. The
-vendor keeps ARM builds in a separate `/arm/` folder, e.g.
-`https://updates.networkoptix.com/metavms/42921/arm/metavms-server-6.1.2.42921-linux_arm64.deb`
-(x64 builds are under `/linux/`). Before
+The installer picks the matching vendor build automatically:
+
+| Server OS (`dpkg --print-architecture`) | Vendor build | File |
+|---|---|---|
+| `amd64` (x86-64) | Server installer | `/linux/…-linux_x64.deb` |
+| `arm64` | ARM64 (Nvidia Jetson, Qualcomm) - Server installer | `/arm/…-linux_arm64.deb` |
+| `armhf` | ARM32 (Raspberry Pi) - Server installer | `/arm/…-linux_arm32.deb` |
+
+Example: `https://updates.networkoptix.com/metavms/42921/arm/metavms-server-6.1.2.42921-linux_arm32.deb`
+
+> **Raspberry Pi:** the vendor's Pi build is ARM32, so it needs a **32-bit
+> (armhf)** OS. On a Pi running a 64-bit OS, the installer uses the arm64
+> (Jetson/Qualcomm) build and warns that the Pi isn't a target for it.
+
+Before
 v2.7 it always downloaded the x64 build, and on an ARM box apt failed with a
 wall of errors like this:
 
@@ -213,8 +222,8 @@ The `:amd64` suffix is the giveaway. Those libraries aren't really missing;
 apt was being asked to install an Intel/AMD package on an ARM CPU. If you see
 this, re-pull the latest `install.sh`.
 
-To force a specific build suffix (rarely needed), set `NX_ARCH=x64` or
-`NX_ARCH=arm64`.
+To force a specific build suffix (rarely needed), set `NX_ARCH=x64`,
+`NX_ARCH=arm64` or `NX_ARCH=arm32`.
 
 > NVIDIA Jetson GPUs are built into the board and don't show up on the PCI
 > bus, so the GPU-driver step reports "No GPU detected" on a Jetson. That's
@@ -305,7 +314,7 @@ curl -fsSL https://twg-security.github.io/twg-nx-deploy/install.sh | sudo INSTAL
 | `ENABLE_NTP`          | `true`             | Turn on network time sync                                |
 | `NONINTERACTIVE`      | `false`            | `true` = skip the menu                                   |
 | `CHECK_ONLY`          | `false`            | `true` = run preflight + dependency checks only, install nothing |
-| `NX_ARCH`             | *(auto)*           | Force the package build suffix: `x64` or `arm64`         |
+| `NX_ARCH`             | *(auto)*           | Force the package build suffix: `x64`, `arm64` or `arm32` |
 | `LOG_FILE`            | `/var/log/twg-nx-deploy-<date>.log` | Where to save the install log           |
 | `NX_PKG_URL`          | *(auto)*           | Override the download URL (wins over `NX_EDITION`)       |
 | `NO_COLOR`            | *(unset)*          | Set to any value to force plain, uncolored output        |
@@ -316,7 +325,7 @@ curl -fsSL https://twg-security.github.io/twg-nx-deploy/install.sh | sudo INSTAL
 ## 6a. Troubleshooting: "unmet dependencies … :amd64 … not installable"
 
 The x64 package was installed on an ARM64 server. Fixed in v2.7: see
-[ARM64 servers (NVIDIA Jetson, Qualcomm)](#arm64-servers-nvidia-jetson-qualcomm). Re-pull the
+[ARM servers (NVIDIA Jetson, Qualcomm, Raspberry Pi)](#arm-servers-nvidia-jetson-qualcomm-raspberry-pi). Re-pull the
 latest `install.sh`.
 
 ---
@@ -344,8 +353,8 @@ it cleanly.
 
 ## 7. Supported systems
 
-Debian and Ubuntu (anything with `apt-get`) on **x86-64 (amd64)** or **ARM64
-(arm64: NVIDIA Jetson, Qualcomm)**. The installer **must run as root** (use `sudo`)
+Debian and Ubuntu (anything with `apt-get`) on **x86-64 (amd64)**, **ARM64
+(arm64: NVIDIA Jetson, Qualcomm)** or **ARM32 (armhf: Raspberry Pi)**. The installer **must run as root** (use `sudo`)
 and stops with a clear message on anything else.
 
 ---
@@ -394,9 +403,10 @@ trigger a redeploy from **Actions → Deploy to GitHub Pages → Run workflow**.
 
 ### Updating the pinned NX version
 1. Update `NX_VERSION` and `NX_BUILD` in `install.sh`.
-2. Confirm the vendor publishes **both** the `/linux/…-linux_x64.deb` and
-   `/arm/…-linux_arm64.deb` files for that build (the preflight URL check will stop
-   ARM installs with a clear "not found" if the arm64 file is missing).
+2. Confirm the vendor publishes all three files for that build:
+   `/linux/…-linux_x64.deb`, `/arm/…-linux_arm64.deb` and
+   `/arm/…-linux_arm32.deb`. If one is missing, the preflight URL check stops
+   installs on that architecture with a clear "not found".
 3. Bump `INSTALLER_VERSION` in `install.sh`.
 4. Commit `install.sh`. The next push to the default branch redeploys Pages
    automatically.
