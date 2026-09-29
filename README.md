@@ -191,10 +191,11 @@ install fail halfway is caught here, before the system is changed.
 download and dry run), prints a pass/fail result, and exits without installing
 anything. Use it to vet a server before a site visit.
 
-### ARM64 / NVIDIA Jetson servers
+### ARM64 servers (NVIDIA Jetson, Qualcomm)
 
 The installer now picks the matching build automatically: `linux_x64.deb` on
-x86-64 servers, `linux_arm64.deb` on ARM64 servers such as Jetson Orin. The
+x86-64 servers, and the vendor's **"ARM64 (Nvidia Jetson, Qualcomm) - Server
+installer"** (`linux_arm64.deb`) on ARM64 servers. The
 vendor keeps ARM builds in a separate `/arm/` folder, e.g.
 `https://updates.networkoptix.com/metavms/42921/arm/metavms-server-6.1.2.42921-linux_arm64.deb`
 (x64 builds are under `/linux/`). Before
@@ -314,7 +315,7 @@ curl -fsSL https://twg-security.github.io/twg-nx-deploy/install.sh | sudo INSTAL
 ## 6a. Troubleshooting: "unmet dependencies … :amd64 … not installable"
 
 The x64 package was installed on an ARM64 server. Fixed in v2.7: see
-[ARM64 / NVIDIA Jetson servers](#arm64--nvidia-jetson-servers). Re-pull the
+[ARM64 servers (NVIDIA Jetson, Qualcomm)](#arm64-servers-nvidia-jetson-qualcomm). Re-pull the
 latest `install.sh`.
 
 ---
@@ -343,7 +344,7 @@ it cleanly.
 ## 7. Supported systems
 
 Debian and Ubuntu (anything with `apt-get`) on **x86-64 (amd64)** or **ARM64
-(arm64, e.g. NVIDIA Jetson)**. The installer **must run as root** (use `sudo`)
+(arm64: NVIDIA Jetson, Qualcomm)**. The installer **must run as root** (use `sudo`)
 and stops with a clear message on anything else.
 
 ---

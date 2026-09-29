@@ -679,6 +679,7 @@ kv "CVEDIA-RT"   "${INSTALL_CVEDIA}$( [[ "${INSTALL_CVEDIA}" == "true" ]] && ech
 kv "Timezone"    "${SET_TIMEZONE:-<unchanged>}"
 kv "NTP"         "${ENABLE_NTP}"
 kv "Package"     "${PKG_FILE}"
+[[ "${NX_ARCH}" == "arm64" && -z "${NX_PKG_URL:-}" ]] && kv "Build" "ARM64 (NVIDIA Jetson, Qualcomm) server installer"
 [[ "${CHECK_ONLY}" == "true" ]] && kv "Mode" "CHECK ONLY — preflight + dependency checks, nothing installed"
 
 # One-line plan for the dashboard header.
