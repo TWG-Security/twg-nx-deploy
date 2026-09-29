@@ -194,7 +194,10 @@ anything. Use it to vet a server before a site visit.
 ### ARM64 / NVIDIA Jetson servers
 
 The installer now picks the matching build automatically: `linux_x64.deb` on
-x86-64 servers, `linux_arm64.deb` on ARM64 servers such as Jetson Orin. Before
+x86-64 servers, `linux_arm64.deb` on ARM64 servers such as Jetson Orin. The
+vendor keeps ARM builds in a separate `/arm/` folder, e.g.
+`https://updates.networkoptix.com/metavms/42921/arm/metavms-server-6.1.2.42921-linux_arm64.deb`
+(x64 builds are under `/linux/`). Before
 v2.7 it always downloaded the x64 build, and on an ARM box apt failed with a
 wall of errors like this:
 
@@ -389,8 +392,8 @@ trigger a redeploy from **Actions → Deploy to GitHub Pages → Run workflow**.
 
 ### Updating the pinned NX version
 1. Update `NX_VERSION` and `NX_BUILD` in `install.sh`.
-2. Confirm the vendor publishes **both** the `-linux_x64.deb` and
-   `-linux_arm64.deb` files for that build (the preflight URL check will stop
+2. Confirm the vendor publishes **both** the `/linux/…-linux_x64.deb` and
+   `/arm/…-linux_arm64.deb` files for that build (the preflight URL check will stop
    ARM installs with a clear "not found" if the arm64 file is missing).
 3. Bump `INSTALLER_VERSION` in `install.sh`.
 4. Commit `install.sh`. The next push to the default branch redeploys Pages

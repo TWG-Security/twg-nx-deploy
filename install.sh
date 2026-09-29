@@ -631,8 +631,9 @@ fi
 # ---------------------------------------------------------------------------
 # 6. Resolve the package URL from the edition (unless explicitly overridden)
 # ---------------------------------------------------------------------------
-# Network Optix publishes a separate .deb per CPU architecture; the filename
-# suffix is the only difference. Picking the x64 build on an ARM box (e.g. an
+# Network Optix publishes a separate .deb per CPU architecture, and each lives
+# in its own folder: x64 under /linux/, arm64 under /arm/, e.g.
+#   .../metavms/42921/arm/metavms-server-6.1.2.42921-linux_arm64.deb Picking the x64 build on an ARM box (e.g. an
 # NVIDIA Jetson) makes apt treat it as a foreign :amd64 package, and EVERY
 # dependency then reads "not installable" — so map the host arch explicitly.
 if [[ -z "${NX_ARCH}" ]]; then
@@ -646,8 +647,9 @@ if [[ "${INSTALL_NX}" == "true" && -z "${NX_ARCH}" && -z "${NX_PKG_URL:-}" ]]; t
   die "Unsupported CPU architecture for the NX mediaserver: ${HOST_ARCH} ($(uname -m)).
         NX server packages are published for x64 (amd64) and arm64 only."
 fi
-WITNESS_URL="https://updates.networkoptix.com/default/${NX_BUILD}/linux/nxwitness-server-${NX_VERSION}.${NX_BUILD}-linux_${NX_ARCH}.deb"
-META_URL="https://updates.networkoptix.com/metavms/${NX_BUILD}/linux/metavms-server-${NX_VERSION}.${NX_BUILD}-linux_${NX_ARCH}.deb"
+case "${NX_ARCH}" in arm64) NX_DIR="arm" ;; *) NX_DIR="linux" ;; esac
+WITNESS_URL="https://updates.networkoptix.com/default/${NX_BUILD}/${NX_DIR}/nxwitness-server-${NX_VERSION}.${NX_BUILD}-linux_${NX_ARCH}.deb"
+META_URL="https://updates.networkoptix.com/metavms/${NX_BUILD}/${NX_DIR}/metavms-server-${NX_VERSION}.${NX_BUILD}-linux_${NX_ARCH}.deb"
 
 if [[ -n "${NX_PKG_URL:-}" ]]; then
   PKG_URL="${NX_PKG_URL}"
