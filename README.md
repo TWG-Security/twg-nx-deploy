@@ -172,6 +172,7 @@ install fail halfway is caught here, before the system is changed.
 | Check | What happens if it fails |
 |-------|--------------------------|
 | CPU architecture is supported (`amd64` → x64 build, `arm64` → arm64 build) | Stops: *unsupported architecture* |
+| Platform: NVIDIA Jetson (with L4T/JetPack version), Qualcomm, other ARM64 board, physical x86, VM or container. Shown as **Platform** at startup | ARM64 board that isn't Jetson/Qualcomm: warning (the vendor's arm64 build targets those). Container: warning. Neither blocks the install |
 | apt/dpkg lock held (e.g. `unattended-upgrades` on first boot) | Waits up to 5 min, then stops |
 | dpkg left half-configured by an earlier interrupted install | Runs `dpkg --configure -a` automatically |
 | Broken package dependencies (`apt-get check`) | Runs `apt-get -f install`; stops if that fails |

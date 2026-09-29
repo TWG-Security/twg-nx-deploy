@@ -394,6 +394,41 @@ detect_secureboot() {
   echo unknown
 }
 
+# detect_platform: identify the hardware so the plan shows WHAT we're installing
+# on, not just the CPU type. Sets PLATFORM_KIND (jetson | qualcomm | arm64-other
+# | x86-vm | x86 | other) and PLATFORM_DESC (human-readable). The NX arm64
+# server build is published for NVIDIA Jetson and Qualcomm boards specifically,
+# so knowing the board matters on ARM. Sources, cheapest first: the device tree
+# (ARM boards), the Jetson L4T release file, DMI (x86), systemd-detect-virt.
+PLATFORM_KIND="other"; PLATFORM_DESC="unknown"
+detect_platform() {
+  local model="" compat="" l4t="" jp="" virt="" vendor="" product=""
+  [[ -r /proc/device-tree/model ]]      && model="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)"
+  [[ -r /proc/device-tree/compatible ]] && compat="$(tr '\0' ' ' < /proc/device-tree/compatible 2>/dev/null || true)"
+  virt="$(systemd-detect-virt 2>/dev/null || true)"; [[ "${virt}" == "none" ]] && virt=""
+
+  if [[ -r /etc/nv_tegra_release ]] || [[ "${compat}" == *nvidia,tegra* ]]; then
+    PLATFORM_KIND="jetson"
+    # "# R36 (release), REVISION: 4.0, ..." -> "L4T R36.4.0"
+    l4t="$(sed -nE '1s/^# R([0-9]+) \(release\), REVISION: ([0-9.]+).*/L4T R\1.\2/p' /etc/nv_tegra_release 2>/dev/null || true)"
+    jp="$(dpkg-query -W -f='${Version}' nvidia-jetpack 2>/dev/null || true)"
+    PLATFORM_DESC="NVIDIA Jetson${model:+ — ${model}}${l4t:+ · ${l4t}}${jp:+ · JetPack ${jp%%-*}}"
+  elif [[ "${compat}" == *qcom,* ]]; then
+    PLATFORM_KIND="qualcomm"
+    PLATFORM_DESC="Qualcomm${model:+ — ${model}}"
+  elif [[ "${HOST_ARCH}" == "arm64" ]]; then
+    PLATFORM_KIND="arm64-other"
+    PLATFORM_DESC="ARM64 board${model:+ — ${model}}${virt:+ (virtual: ${virt})}"
+  elif [[ "${HOST_ARCH}" == "amd64" ]]; then
+    vendor="$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)"
+    product="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
+    if [[ -n "$(systemd-detect-virt --container 2>/dev/null | grep -v '^none$' || true)" ]]; then
+      PLATFORM_KIND="x86-vm"; PLATFORM_DESC="Container (${virt})"
+    elif [[ -n "${virt}" ]]; then PLATFORM_KIND="x86-vm"; PLATFORM_DESC="Virtual machine (${virt})${product:+ — ${product}}"
+    else PLATFORM_KIND="x86"; PLATFORM_DESC="x86-64${vendor:+ — ${vendor}}${product:+ ${product}}"; fi
+  fi
+}
+
 # free_mb PATH: free space (MB) on the filesystem holding PATH, or its nearest
 # existing parent (/opt may not exist yet on a fresh box).
 free_mb() {
@@ -559,6 +594,8 @@ kv "Kernel" "$(uname -r)"
 HOST_ARCH="$(dpkg --print-architecture 2>/dev/null || echo unknown)"   # amd64 | arm64 | ...
 kv "Arch"   "$(uname -m) (dpkg: ${HOST_ARCH})"
 kv "Host"   "$(hostname 2>/dev/null || echo unknown)"
+detect_platform
+kv "Platform" "${PLATFORM_DESC}"
 
 # ---------------------------------------------------------------------------
 # 4. Confirm this is a Debian/Ubuntu box (we need apt-get)
@@ -718,6 +755,21 @@ enter_tui
 # route to the vendor) BEFORE touching anything, and say plainly what's wrong.
 phase_begin "$P_PRE"
 
+# Platform fit. The vendor's arm64 server build is "ARM64 (Nvidia Jetson,
+# Qualcomm)"; other ARM64 boards (Raspberry Pi, Ampere, cloud Graviton...) may
+# or may not run it, so flag it rather than block. Containers get a note: the
+# mediaserver expects systemd and real storage.
+phase_detail "Platform: ${PLATFORM_DESC}"
+if [[ "${INSTALL_NX}" == "true" && -z "${NX_PKG_URL:-}" ]]; then
+  case "${PLATFORM_KIND}" in
+    arm64-other) add_warn "This ARM64 board isn't an NVIDIA Jetson or Qualcomm device — the NX arm64 server build targets those. It may still work; test before deploying." ;;
+  esac
+fi
+case "$(systemd-detect-virt --container 2>/dev/null || true)" in
+  ""|none) ;;
+  *) add_warn "Running inside a container ($(systemd-detect-virt --container 2>/dev/null)) — the NX mediaserver expects a full host or VM with systemd." ;;
+esac
+
 # Tools the rest of the run relies on. Missing ones get installed below, after
 # the package index is refreshed.
 PF_MISSING=()
@@ -838,6 +890,7 @@ if [[ "${CHECK_ONLY}" == "true" ]]; then
   if (( ${#WARNINGS[@]} )); then ok "Preflight passed (with notes)."; else ok "Preflight passed."; fi
   [[ "${INSTALL_NX}" == "true" ]] && ok "$(edition_label "${NX_EDITION}") ${NX_VERSION} (${PKG_ARCH}) can be installed on this server."
   if (( ${#WARNINGS[@]} )); then for w in "${WARNINGS[@]}"; do warn "$w"; done; fi
+  kv "Platform" "${PLATFORM_DESC}"
   kv "Log file" "${LOG_FILE}"
   note "Nothing was installed. Re-run without CHECK_ONLY to deploy."
   printf '\n'
