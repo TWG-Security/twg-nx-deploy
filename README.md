@@ -12,6 +12,12 @@ like a proper installer app instead of a wall of scrolling logs. When it
 finishes, your screen is restored and a clean summary is printed. The noisy
 apt/dpkg/curl output goes to the log file (see [section 4](#4-the-install-log)).
 
+Before it installs anything, the installer runs **preflight and dependency
+checks** (CPU architecture, apt/dpkg health, disk space, vendor download
+reachable, and an apt dry run of the NX package). If the server can't take the
+install, it stops with a plain-English reason, before any changes are made. See
+[section 4a](#4a-preflight--dependency-checks-v27).
+
 It degrades gracefully: a smaller or older terminal gets tidy line-by-line
 status; a plain pipe / CI / cron (no terminal) or `NO_COLOR` gets plain text.
 Set `NO_TUI=1` to force line-by-line mode on a full terminal.
@@ -88,6 +94,11 @@ curl -fsSL https://twg-security.github.io/twg-nx-deploy/install.sh | sudo INSTAL
 curl -fsSL https://twg-security.github.io/twg-nx-deploy/install.sh | sudo NX_EDITION=meta INSTALL_WEBMIN=true SET_TIMEZONE=America/Denver bash
 ```
 
+**Check a server without installing anything** (preflight + dependency dry run)
+```bash
+curl -fsSL https://twg-security.github.io/twg-nx-deploy/install.sh | sudo CHECK_ONLY=true bash
+```
+
 **Install a different NX build** (paste the vendor URL)
 ```bash
 curl -fsSL https://twg-security.github.io/twg-nx-deploy/install.sh | sudo \
@@ -148,6 +159,75 @@ usually don't have to open the file. To put the log somewhere else:
 ```bash
 curl -fsSL https://twg-security.github.io/twg-nx-deploy/install.sh | sudo LOG_FILE=/root/nx-install.log bash
 ```
+
+---
+
+## 4a. Preflight & dependency checks (v2.7)
+
+Two phases run at the top of the checklist. Anything that would make the
+install fail halfway is caught here, before the system is changed.
+
+**Preflight checks** (always run):
+
+| Check | What happens if it fails |
+|-------|--------------------------|
+| CPU architecture is supported (`amd64` → x64 build, `arm64` → arm64 build, `armhf` → arm32 build) | Stops: *unsupported architecture* |
+| Platform: NVIDIA Jetson (with L4T/JetPack version), Qualcomm, Raspberry Pi, other ARM board, physical x86, VM or container. Shown as **Platform** at startup | Warning for an ARM board the vendor's build doesn't target, a Raspberry Pi on a 64-bit OS, or a container. Warnings don't block the install |
+| apt/dpkg lock held (e.g. `unattended-upgrades` on first boot) | Waits up to 5 min, then stops |
+| dpkg left half-configured by an earlier interrupted install | Runs `dpkg --configure -a` automatically |
+| Broken package dependencies (`apt-get check`) | Runs `apt-get -f install`; stops if that fails |
+| Free space: `/opt` ≥ 2 GB, temp dir ≥ 512 MB | Stops with the actual free space |
+| Base tools present (`curl`, `dpkg-deb`, `systemctl`, `timedatectl`) | Installs the missing ones |
+| NX package exists on the vendor server **for this architecture** | Stops: *can't reach server* or *not found (HTTP 404)* |
+
+**Check package dependencies** (after the download):
+
+1. Reads the `.deb`'s architecture and confirms it matches the server. This
+   catches a wrong `NX_PKG_URL`, like an x64 link on an ARM box.
+2. Runs an apt **dry run** (`apt-get install -s`) of the package. If any
+   dependency can't be satisfied, it stops and lists exactly which ones.
+   Nothing has been installed at that point.
+
+**Check-only mode.** `CHECK_ONLY=true` runs just these checks (including the
+download and dry run), prints a pass/fail result, and exits without installing
+anything. Use it to vet a server before a site visit.
+
+### ARM servers (NVIDIA Jetson, Qualcomm, Raspberry Pi)
+
+The installer picks the matching vendor build automatically:
+
+| Server OS (`dpkg --print-architecture`) | Vendor build | File |
+|---|---|---|
+| `amd64` (x86-64) | Server installer | `/linux/…-linux_x64.deb` |
+| `arm64` | ARM64 (Nvidia Jetson, Qualcomm) - Server installer | `/arm/…-linux_arm64.deb` |
+| `armhf` | ARM32 (Raspberry Pi) - Server installer | `/arm/…-linux_arm32.deb` |
+
+Example: `https://updates.networkoptix.com/metavms/42921/arm/metavms-server-6.1.2.42921-linux_arm32.deb`
+
+> **Raspberry Pi:** the vendor's Pi build is ARM32, so it needs a **32-bit
+> (armhf)** OS. On a Pi running a 64-bit OS, the installer uses the arm64
+> (Jetson/Qualcomm) build and warns that the Pi isn't a target for it.
+
+Before
+v2.7 it always downloaded the x64 build, and on an ARM box apt failed with a
+wall of errors like this:
+
+```
+networkoptix-metavms-mediaserver:amd64 : Depends: cifs-utils:amd64 but it is not installable
+                                         Depends: libexpat1:amd64 (>= 2.2.9) but it is not installable
+E: Unable to correct problems, you have held broken packages.
+```
+
+The `:amd64` suffix is the giveaway. Those libraries aren't really missing;
+apt was being asked to install an Intel/AMD package on an ARM CPU. If you see
+this, re-pull the latest `install.sh`.
+
+To force a specific build suffix (rarely needed), set `NX_ARCH=x64`,
+`NX_ARCH=arm64` or `NX_ARCH=arm32`.
+
+> NVIDIA Jetson GPUs are built into the board and don't show up on the PCI
+> bus, so the GPU-driver step reports "No GPU detected" on a Jetson. That's
+> expected: JetPack already provides the GPU stack.
 
 ---
 
@@ -233,6 +313,8 @@ curl -fsSL https://twg-security.github.io/twg-nx-deploy/install.sh | sudo INSTAL
 | `SET_TIMEZONE`        | `America/New_York` | Timezone to set (**blank = leave unchanged**)            |
 | `ENABLE_NTP`          | `true`             | Turn on network time sync                                |
 | `NONINTERACTIVE`      | `false`            | `true` = skip the menu                                   |
+| `CHECK_ONLY`          | `false`            | `true` = run preflight + dependency checks only, install nothing |
+| `NX_ARCH`             | *(auto)*           | Force the package build suffix: `x64`, `arm64` or `arm32` |
 | `LOG_FILE`            | `/var/log/twg-nx-deploy-<date>.log` | Where to save the install log           |
 | `NX_PKG_URL`          | *(auto)*           | Override the download URL (wins over `NX_EDITION`)       |
 | `NO_COLOR`            | *(unset)*          | Set to any value to force plain, uncolored output        |
@@ -240,7 +322,15 @@ curl -fsSL https://twg-security.github.io/twg-nx-deploy/install.sh | sudo INSTAL
 
 ---
 
-## 6a. Troubleshooting: install hangs on a magenta setup screen
+## 6a. Troubleshooting: "unmet dependencies … :amd64 … not installable"
+
+The x64 package was installed on an ARM64 server. Fixed in v2.7: see
+[ARM servers (NVIDIA Jetson, Qualcomm, Raspberry Pi)](#arm-servers-nvidia-jetson-qualcomm-raspberry-pi). Re-pull the
+latest `install.sh`.
+
+---
+
+## 6b. Troubleshooting: install hangs on a magenta setup screen
 
 If a run stalls on a pink/magenta full-screen box titled **"Configuring
 networkoptix-mediaserver"** that says *"Installation is not yet complete… run
@@ -263,8 +353,9 @@ it cleanly.
 
 ## 7. Supported systems
 
-Debian and Ubuntu (anything with `apt-get`). The installer **must run as root**
-(use `sudo`) and stops with a clear message on anything else.
+Debian and Ubuntu (anything with `apt-get`) on **x86-64 (amd64)**, **ARM64
+(arm64: NVIDIA Jetson, Qualcomm)** or **ARM32 (armhf: Raspberry Pi)**. The installer **must run as root** (use `sudo`)
+and stops with a clear message on anything else.
 
 ---
 
@@ -312,5 +403,10 @@ trigger a redeploy from **Actions → Deploy to GitHub Pages → Run workflow**.
 
 ### Updating the pinned NX version
 1. Update `NX_VERSION` and `NX_BUILD` in `install.sh`.
-2. Commit `install.sh`. The next push to the default branch redeploys Pages
+2. Confirm the vendor publishes all three files for that build:
+   `/linux/…-linux_x64.deb`, `/arm/…-linux_arm64.deb` and
+   `/arm/…-linux_arm32.deb`. If one is missing, the preflight URL check stops
+   installs on that architecture with a clear "not found".
+3. Bump `INSTALLER_VERSION` in `install.sh`.
+4. Commit `install.sh`. The next push to the default branch redeploys Pages
    automatically.
