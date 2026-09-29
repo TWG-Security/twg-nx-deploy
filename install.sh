@@ -28,6 +28,13 @@
 # When run from a real terminal an interactive MENU appears so a tech can pick
 # options; pass NONINTERACTIVE=true (or run with no TTY) to use env-var defaults.
 #
+# Before anything is installed a PREFLIGHT phase checks the box (CPU
+# architecture, apt/dpkg health, locks, disk space, vendor URL reachable), and
+# after the download a DEPENDENCIES phase confirms the .deb matches this CPU and
+# that apt can satisfy every dependency (a dry run) — so a bad fit stops with a
+# plain-English reason instead of apt's raw "unmet dependencies" wall. Set
+# CHECK_ONLY=true to run just those checks and change nothing else.
+#
 # Honors NO_COLOR (https://no-color.org) and NO_TUI.
 #
 # This file is PUBLIC. No secrets, license keys, or internal hostnames live here.
@@ -36,7 +43,7 @@ set -euo pipefail
 
 # Installer version — surfaced on screen so it's obvious at a glance which build
 # of THIS script is running (helps tell a fresh deploy from a cached one).
-INSTALLER_VERSION="2.6"
+INSTALLER_VERSION="2.7"
 
 # ===========================================================================
 # UI toolkit — capability detection, palette, banner, dashboard, phase engine
@@ -141,7 +148,9 @@ else
 fi
 
 # LOG_FILE is finalized in the logging section; declare early so helpers are
-# safe to call before it exists (they no-op until it's set).
+# safe to call before it exists (they no-op until it's set). Keep any
+# user-supplied LOG_FILE=... so the documented override still works.
+LOG_FILE_REQ="${LOG_FILE:-}"
 LOG_FILE=""
 
 # Dashboard state.
@@ -385,6 +394,48 @@ detect_secureboot() {
   echo unknown
 }
 
+# free_mb PATH: free space (MB) on the filesystem holding PATH, or its nearest
+# existing parent (/opt may not exist yet on a fresh box).
+free_mb() {
+  local d="$1"
+  while [[ ! -e "$d" && "$d" != "/" ]]; do d="$(dirname "$d")"; done
+  df -Pk "$d" 2>/dev/null | awk 'NR==2 {print int($4 / 1024)}'
+}
+
+# apt_locked: true while another apt/dpkg (often unattended-upgrades on a fresh
+# Ubuntu boot) holds the package locks. Without fuser we can't tell — say no.
+apt_locked() {
+  command -v fuser >/dev/null 2>&1 || return 1
+  fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1
+}
+# wait_apt_lock: wait up to 5 minutes for the locks to clear.
+wait_apt_lock() {
+  local waited=0
+  while apt_locked; do
+    (( waited >= 300 )) && return 1
+    sleep 5; waited=$((waited + 5))
+  done
+  return 0
+}
+
+# url_probe URL: fetch the FIRST BYTE only (cheaper than a full download, and
+# more reliable than HEAD, which some CDNs reject). Echoes "<curl_rc> <http>".
+url_probe() {
+  local code rc=0
+  code="$(curl -sSL -r 0-0 -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 30 "$1" 2>>"${LOG_FILE}")" || rc=$?
+  printf '%s %s' "${rc}" "${code:-000}"
+}
+
+# dep_sim DEB OUTFILE: apt dry run (-s) of installing the .deb. Nothing is
+# changed on the system; apt just reports whether every dependency resolves.
+# Output goes to OUTFILE (for parsing) and stdout (for the log).
+dep_sim() {
+  local rc=0
+  apt-get install -s "$1" > "$2" 2>&1 || rc=$?
+  cat "$2"
+  return "${rc}"
+}
+
 # die: fatal error. Leave the dashboard, print a red banner on the normal
 # screen with the last log lines, and exit non-zero.
 die() {
@@ -420,6 +471,10 @@ INSTALL_GPU_DRIVERS="${INSTALL_GPU_DRIVERS:-auto}"  # auto | true | false
 SET_TIMEZONE="${SET_TIMEZONE:-America/New_York}"    # empty string skips tz change
 ENABLE_NTP="${ENABLE_NTP:-true}"             # enable network time sync?
 NONINTERACTIVE="${NONINTERACTIVE:-false}"    # force-skip the interactive menu?
+CHECK_ONLY="${CHECK_ONLY:-false}"            # run preflight + dependency checks only
+NX_ARCH="${NX_ARCH:-}"                       # force package arch suffix (x64|arm64); blank = auto
+MIN_FREE_MB_OPT=2048                         # /opt free space below this = fatal
+MIN_FREE_MB_TMP=512                          # temp free space below this = fatal
 
 # Pinned NX release. Bump these when TWG pins a new build.
 # See README.md -> "Updating the pinned version".
@@ -462,7 +517,7 @@ export NEEDRESTART_SUSPEND=1
 # The dashboard shows the summary; every command's raw output goes here, so the
 # log is a complete, timestamped, plain-text record of the run.
 LOG_TS="$(date +%Y%m%d-%H%M%S)"
-LOG_FILE="${LOG_FILE:-/var/log/twg-nx-deploy-${LOG_TS}.log}"
+LOG_FILE="${LOG_FILE_REQ:-/var/log/twg-nx-deploy-${LOG_TS}.log}"
 mkdir -p "$(dirname "${LOG_FILE}")" 2>/dev/null || true
 {
   echo "=========================================================="
@@ -501,7 +556,8 @@ DISTRO_ID="${ID:-unknown}"            # ubuntu | debian | ...
 DISTRO_LIKE="${ID_LIKE:-}"            # e.g. "debian"
 kv "Distro" "${PRETTY_NAME:-unknown} (id=${DISTRO_ID})"
 kv "Kernel" "$(uname -r)"
-kv "Arch"   "$(uname -m)"
+HOST_ARCH="$(dpkg --print-architecture 2>/dev/null || echo unknown)"   # amd64 | arm64 | ...
+kv "Arch"   "$(uname -m) (dpkg: ${HOST_ARCH})"
 kv "Host"   "$(hostname 2>/dev/null || echo unknown)"
 
 # ---------------------------------------------------------------------------
@@ -555,6 +611,8 @@ if [[ -n "${MENU_TTY}" ]]; then
 
   # We deliberately do NOT ask "install the mediaserver?" — that's the whole
   # reason someone runs this. Automation can still set INSTALL_NX=false.
+  # A CHECK_ONLY run installs nothing, so only the edition question matters.
+  if [[ "${CHECK_ONLY}" != "true" ]]; then
   case "${INSTALL_GPU_DRIVERS}" in false) gpu_def="false" ;; *) gpu_def="true" ;; esac
   if [[ "$(ask_yn "Detect GPU and install drivers?" "${gpu_def}")" == "true" ]]; then
     INSTALL_GPU_DRIVERS="auto"
@@ -565,6 +623,7 @@ if [[ -n "${MENU_TTY}" ]]; then
   INSTALL_CVEDIA="$(ask_yn "Install CVEDIA-RT? (runs its own setup you'll step through)" "${INSTALL_CVEDIA}")"
   SET_TIMEZONE="$(ask_val "Timezone (blank = leave unchanged)" "${SET_TIMEZONE}")"
   ENABLE_NTP="$(ask_yn "Enable NTP time sync?" "${ENABLE_NTP}")"
+  fi
 else
   note "Non-interactive run — using env-var defaults (no menu)."
 fi
@@ -572,8 +631,23 @@ fi
 # ---------------------------------------------------------------------------
 # 6. Resolve the package URL from the edition (unless explicitly overridden)
 # ---------------------------------------------------------------------------
-WITNESS_URL="https://updates.networkoptix.com/default/${NX_BUILD}/linux/nxwitness-server-${NX_VERSION}.${NX_BUILD}-linux_x64.deb"
-META_URL="https://updates.networkoptix.com/metavms/${NX_BUILD}/linux/metavms-server-${NX_VERSION}.${NX_BUILD}-linux_x64.deb"
+# Network Optix publishes a separate .deb per CPU architecture; the filename
+# suffix is the only difference. Picking the x64 build on an ARM box (e.g. an
+# NVIDIA Jetson) makes apt treat it as a foreign :amd64 package, and EVERY
+# dependency then reads "not installable" — so map the host arch explicitly.
+if [[ -z "${NX_ARCH}" ]]; then
+  case "${HOST_ARCH}" in
+    amd64) NX_ARCH="x64" ;;
+    arm64) NX_ARCH="arm64" ;;
+    *)     NX_ARCH="" ;;
+  esac
+fi
+if [[ "${INSTALL_NX}" == "true" && -z "${NX_ARCH}" && -z "${NX_PKG_URL:-}" ]]; then
+  die "Unsupported CPU architecture for the NX mediaserver: ${HOST_ARCH} ($(uname -m)).
+        NX server packages are published for x64 (amd64) and arm64 only."
+fi
+WITNESS_URL="https://updates.networkoptix.com/default/${NX_BUILD}/linux/nxwitness-server-${NX_VERSION}.${NX_BUILD}-linux_${NX_ARCH}.deb"
+META_URL="https://updates.networkoptix.com/metavms/${NX_BUILD}/linux/metavms-server-${NX_VERSION}.${NX_BUILD}-linux_${NX_ARCH}.deb"
 
 if [[ -n "${NX_PKG_URL:-}" ]]; then
   PKG_URL="${NX_PKG_URL}"
@@ -603,21 +677,27 @@ kv "CVEDIA-RT"   "${INSTALL_CVEDIA}$( [[ "${INSTALL_CVEDIA}" == "true" ]] && ech
 kv "Timezone"    "${SET_TIMEZONE:-<unchanged>}"
 kv "NTP"         "${ENABLE_NTP}"
 kv "Package"     "${PKG_FILE}"
+[[ "${CHECK_ONLY}" == "true" ]] && kv "Mode" "CHECK ONLY — preflight + dependency checks, nothing installed"
 
 # One-line plan for the dashboard header.
-PLAN_SUMMARY="$(edition_label "${NX_EDITION}") ${NX_VERSION} · GPU ${INSTALL_GPU_DRIVERS} · Webmin ${INSTALL_WEBMIN} · CVEDIA ${INSTALL_CVEDIA} · TZ ${SET_TIMEZONE:-unchanged}"
+PLAN_SUMMARY="$(edition_label "${NX_EDITION}") ${NX_VERSION} ${NX_ARCH:-?} · GPU ${INSTALL_GPU_DRIVERS} · Webmin ${INSTALL_WEBMIN} · CVEDIA ${INSTALL_CVEDIA} · TZ ${SET_TIMEZONE:-unchanged}"
+[[ "${CHECK_ONLY}" == "true" ]] && PLAN_SUMMARY="CHECK ONLY · $(edition_label "${NX_EDITION}") ${NX_VERSION} ${NX_ARCH:-?}"
 
 # Build the phase checklist from the chosen options (order = run order).
-P_DL=-1; P_NX=-1; P_GPU=-1; P_WEB=-1; P_TIME=-1; P_SVC=-1
+P_PRE=-1; P_DL=-1; P_DEP=-1; P_NX=-1; P_GPU=-1; P_WEB=-1; P_TIME=-1; P_SVC=-1
 ED_LABEL="$(edition_label "${NX_EDITION}")"
+push_phase "Preflight checks"; P_PRE=$LAST_PHASE
 if [[ "${INSTALL_NX}" == "true" ]]; then
   push_phase "Download ${ED_LABEL} package";    P_DL=$LAST_PHASE
-  push_phase "Install ${ED_LABEL} mediaserver"; P_NX=$LAST_PHASE
+  push_phase "Check package dependencies";      P_DEP=$LAST_PHASE
+  [[ "${CHECK_ONLY}" == "true" ]] || { push_phase "Install ${ED_LABEL} mediaserver"; P_NX=$LAST_PHASE; }
 fi
-[[ "${INSTALL_GPU_DRIVERS}" != "false" ]] && { push_phase "GPU drivers"; P_GPU=$LAST_PHASE; }
-[[ "${INSTALL_WEBMIN}" == "true" ]]       && { push_phase "Webmin admin panel"; P_WEB=$LAST_PHASE; }
-push_phase "Time & clock"; P_TIME=$LAST_PHASE
-[[ "${INSTALL_NX}" == "true" ]] && { push_phase "Service status"; P_SVC=$LAST_PHASE; }
+if [[ "${CHECK_ONLY}" != "true" ]]; then
+  [[ "${INSTALL_GPU_DRIVERS}" != "false" ]] && { push_phase "GPU drivers"; P_GPU=$LAST_PHASE; }
+  [[ "${INSTALL_WEBMIN}" == "true" ]]       && { push_phase "Webmin admin panel"; P_WEB=$LAST_PHASE; }
+  push_phase "Time & clock"; P_TIME=$LAST_PHASE
+  [[ "${INSTALL_NX}" == "true" ]] && { push_phase "Service status"; P_SVC=$LAST_PHASE; }
+fi
 
 # ---------------------------------------------------------------------------
 # 8. Temp workspace (removed on exit by the cleanup trap)
@@ -629,7 +709,86 @@ WORKDIR="$(mktemp -d)"
 # ===========================================================================
 enter_tui
 
-# --- NX mediaserver: download + install ------------------------------------
+# --- Preflight: is this box fit to install on? -----------------------------
+# Like a pre-flight walkaround: catch the things that would make the install
+# fail halfway (wrong CPU, a half-configured dpkg, a held lock, a full disk, no
+# route to the vendor) BEFORE touching anything, and say plainly what's wrong.
+phase_begin "$P_PRE"
+
+# Tools the rest of the run relies on. Missing ones get installed below, after
+# the package index is refreshed.
+PF_MISSING=()
+for _t in curl dpkg-deb systemctl timedatectl; do
+  command -v "$_t" >/dev/null 2>&1 || PF_MISSING+=("$_t")
+done
+
+if apt_locked; then
+  phase_run "Waiting for another package manager (e.g. unattended-upgrades) to finish" wait_apt_lock \
+    || { phase_end "$P_PRE" fail; die "apt/dpkg is still locked by another process after 5 minutes.
+        Check with:  ps aux | grep -E 'apt|dpkg'   then re-run the installer."; }
+fi
+
+# A previously interrupted install leaves dpkg half-configured, and apt then
+# refuses to install anything. Repair it the standard way, or stop clearly.
+if [[ -n "$(dpkg --audit 2>/dev/null)" ]]; then
+  phase_run "Repairing an interrupted package install (dpkg --configure -a)" dpkg --configure -a \
+    || add_warn "dpkg --configure -a reported errors — see the log."
+fi
+if ! apt-get check >> "${LOG_FILE}" 2>&1; then
+  phase_run "Fixing broken package dependencies (apt-get -f install)" apt-get -f install -y \
+    || { phase_end "$P_PRE" fail; die "The system's package database has broken dependencies apt cannot fix.
+        Run 'sudo apt-get -f install' and resolve the errors, then re-run."; }
+fi
+
+# Disk space: the mediaserver lives under /opt; the .deb lands in the temp dir.
+PF_OPT_MB="$(free_mb /opt)"; PF_TMP_MB="$(free_mb "${WORKDIR}")"
+phase_detail "Free space: /opt ${PF_OPT_MB:-?} MB · temp ${PF_TMP_MB:-?} MB"
+if [[ "${INSTALL_NX}" == "true" ]]; then
+  if [[ -n "${PF_OPT_MB}" ]] && (( PF_OPT_MB < MIN_FREE_MB_OPT )); then
+    phase_end "$P_PRE" fail
+    die "Only ${PF_OPT_MB} MB free for /opt — need at least ${MIN_FREE_MB_OPT} MB for the mediaserver."
+  fi
+  if [[ -n "${PF_TMP_MB}" ]] && (( PF_TMP_MB < MIN_FREE_MB_TMP )); then
+    phase_end "$P_PRE" fail
+    die "Only ${PF_TMP_MB} MB free in the temp directory (${WORKDIR%/*}) — need ${MIN_FREE_MB_TMP} MB to download the package."
+  fi
+fi
+
+phase_run "Refreshing package index" apt-get update -y \
+  || add_warn "apt-get update reported errors (a repo may be unreachable) — continuing with the cached index."
+
+if (( ${#PF_MISSING[@]} )); then
+  # dpkg-deb ships in the dpkg package; systemctl in systemd; timedatectl in
+  # systemd (or systemd-timesyncd on some minimal images).
+  _pkgs=(); for _t in "${PF_MISSING[@]}"; do
+    case "$_t" in curl) _pkgs+=(curl ca-certificates) ;; dpkg-deb) _pkgs+=(dpkg) ;; *) _pkgs+=(systemd) ;; esac
+  done
+  phase_run "Installing missing base tools: ${PF_MISSING[*]}" apt-get install -y "${_pkgs[@]}" \
+    || add_warn "Could not install: ${PF_MISSING[*]} — later steps may fail."
+fi
+
+# Vendor URL reachable, and the file actually exists for THIS architecture.
+if [[ "${INSTALL_NX}" == "true" ]]; then
+  read -r _rc _code <<<"$(url_probe "${PKG_URL}")"
+  logline "  · URL probe: curl rc=${_rc} http=${_code} ${PKG_URL}"
+  if [[ "${_code}" == "200" || "${_code}" == "206" ]]; then
+    if [[ -n "${NX_PKG_URL:-}" ]]; then phase_detail "Package found at the custom NX_PKG_URL."
+    else phase_detail "Package found on the vendor server (${NX_ARCH} build)."; fi
+  elif [[ "${_rc}" != "0" ]]; then
+    phase_end "$P_PRE" fail
+    die "Cannot reach the Network Optix download server (curl error ${_rc}).
+        Check internet access, DNS and firewall/proxy rules for updates.networkoptix.com."
+  else
+    phase_end "$P_PRE" fail
+    die "The NX package was not found (HTTP ${_code}):
+        ${PKG_URL}
+        Build ${NX_BUILD} may not be published for ${HOST_ARCH}. Pick a build that is,
+        or pass the exact vendor link with NX_PKG_URL=..."
+  fi
+fi
+phase_end "$P_PRE"
+
+# --- NX mediaserver: download, dependency check, install -------------------
 if [[ "${INSTALL_NX}" == "true" ]]; then
   phase_begin "$P_DL"
   if ! phase_run "Fetching ${PKG_FILE}" \
@@ -640,8 +799,51 @@ if [[ "${INSTALL_NX}" == "true" ]]; then
   fi
   phase_end "$P_DL"
 
+  # Dependency check: confirm the .deb is built for this CPU, then have apt
+  # DRY-RUN the install. If anything can't be satisfied we stop here with the
+  # list of what's missing, before dpkg has touched the system.
+  phase_begin "$P_DEP"
+  PKG_ARCH="$(dpkg-deb -f "${WORKDIR}/${PKG_FILE}" Architecture 2>/dev/null || true)"
+  if [[ -z "${PKG_ARCH}" ]]; then
+    phase_end "$P_DEP" fail
+    die "The downloaded file is not a valid .deb package:
+        ${PKG_URL}"
+  fi
+  if [[ "${PKG_ARCH}" != "all" && "${PKG_ARCH}" != "${HOST_ARCH}" ]]; then
+    phase_end "$P_DEP" fail
+    die "Wrong package for this server: it's built for ${PKG_ARCH}, but this server is ${HOST_ARCH} ($(uname -m)).
+        Drop NX_PKG_URL/NX_ARCH to let the installer pick the matching build."
+  fi
+  phase_detail "Package is built for ${PKG_ARCH} — matches this server."
+  DEP_OUT="${WORKDIR}/dep-sim.txt"
+  if ! phase_run "Dry-run install to verify dependencies" dep_sim "${WORKDIR}/${PKG_FILE}" "${DEP_OUT}"; then
+    phase_end "$P_DEP" fail
+    # Pull just the hard "Depends:" lines out of apt's report (Recommends don't block).
+    UNMET="$(grep -oE 'Depends: .*' "${DEP_OUT}" 2>/dev/null | sed 's/^Depends: /        - /' | head -n 8 || true)"
+    [[ -n "${UNMET}" ]] || UNMET="        (see the log for the full apt report)"
+    die "apt cannot satisfy the NX package's dependencies on this system:
+${UNMET}
+        Make sure the standard ${DISTRO_ID} repos (incl. 'universe' on Ubuntu) are enabled, then re-run."
+  fi
+  phase_detail "All dependencies resolve."
+  phase_end "$P_DEP"
+fi
+
+if [[ "${CHECK_ONLY}" == "true" ]]; then
+  exit_tui
+  section "Check result"
+  if (( ${#WARNINGS[@]} )); then ok "Preflight passed (with notes)."; else ok "Preflight passed."; fi
+  [[ "${INSTALL_NX}" == "true" ]] && ok "$(edition_label "${NX_EDITION}") ${NX_VERSION} (${PKG_ARCH}) can be installed on this server."
+  if (( ${#WARNINGS[@]} )); then for w in "${WARNINGS[@]}"; do warn "$w"; done; fi
+  kv "Log file" "${LOG_FILE}"
+  note "Nothing was installed. Re-run without CHECK_ONLY to deploy."
+  printf '\n'
+  logline "Check-only run complete."
+  exit 0
+fi
+
+if [[ "${INSTALL_NX}" == "true" ]]; then
   phase_begin "$P_NX"
-  phase_run "Refreshing package index" apt-get update -y || true
   # apt resolves the .deb's dependencies; the Dpkg::Options keep it unattended
   # on a conffile conflict (keep existing / fall back to default) so the
   # mediaserver postinst never blocks headless.
